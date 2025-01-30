@@ -419,6 +419,7 @@ std::vector<std::optional<path>> route(
     case search_profile::kWheelchair:
       return r(get_dijkstra<foot<true, elevator_tracking>>());
     case search_profile::kBike: return r(get_dijkstra<bike>());
+    case search_profile::kODM: [[fallthrough]];
     case search_profile::kCar: return r(get_dijkstra<car>());
     case search_profile::kCarParking:
       return r(get_dijkstra<car_parking<false>>());
@@ -461,6 +462,7 @@ std::optional<path> route(ways const& w,
     case search_profile::kWheelchair:
       return r(get_dijkstra<foot<true, elevator_tracking>>());
     case search_profile::kBike: return r(get_dijkstra<bike>());
+    case search_profile::kODM: [[fallthrough]];
     case search_profile::kCar: return r(get_dijkstra<car>());
     case search_profile::kCarParking:
       return r(get_dijkstra<car_parking<false>>());
@@ -500,6 +502,7 @@ std::vector<std::optional<path>> route(
     case search_profile::kWheelchair:
       return r(get_dijkstra<foot<true, elevator_tracking>>());
     case search_profile::kBike: return r(get_dijkstra<bike>());
+    case search_profile::kODM: [[fallthrough]];
     case search_profile::kCar: return r(get_dijkstra<car>());
     case search_profile::kCarParking:
       return r(get_dijkstra<car_parking<false>>());
@@ -537,6 +540,7 @@ std::optional<path> route(ways const& w,
     case search_profile::kWheelchair:
       return r(get_dijkstra<foot<true, elevator_tracking>>());
     case search_profile::kBike: return r(get_dijkstra<bike>());
+    case search_profile::kODM: [[fallthrough]];
     case search_profile::kCar: return r(get_dijkstra<car>());
     case search_profile::kCarParking:
       return r(get_dijkstra<car_parking<false>>());
