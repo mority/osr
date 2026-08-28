@@ -148,6 +148,9 @@ target_link_libraries(osr-cch osr conf ${osr-resource-libs})
 add_executable(osr-compare exe/compare.cc)
 target_link_libraries(osr-compare osr conf ${osr-resource-libs})
 
+add_executable(osr-cch-benchmark exe/cch_benchmark.cc)
+target_link_libraries(osr-cch-benchmark osr conf ${osr-resource-libs})
+
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
 target_link_libraries(osr-backend osr web-server conf boost-json ${osr-resource-libs})

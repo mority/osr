@@ -21,8 +21,9 @@ namespace osr {
 // node of the hierarchy.
 using cch_rank_t = cista::strong<std::uint32_t, struct cch_rank_>;
 
-// Index of an entry in the up-/downward arc entry arrays.
-using cch_entry_idx_t = std::uint32_t;
+// Index of an entry in the up-/downward arc entry arrays. 64 bit: a planet
+// sized hierarchy passes two billion entries during contraction.
+using cch_entry_idx_t = std::uint64_t;
 
 // Index of an adjacency slot, i.e. of an undirected pair {lower, higher}.
 using cch_slot_idx_t = std::uint32_t;
@@ -185,11 +186,11 @@ struct cch {
   // CSR over the entries of every slot.
   vec<cch_entry_idx_t> up_ofs_;  // size: n_slots + 1
   vec<cch_entry_idx_t> dn_ofs_;  // size: n_slots + 1
-  vec<cch_entry> up_;
-  vec<cch_entry> dn_;
+  vec64<cch_entry> up_;
+  vec64<cch_entry> dn_;
 
   vec_map<cch_rank_t, cch_entry_idx_t> loop_ofs_;  // size: n_ranks + 1
-  vec<cch_entry> loop_;
+  vec64<cch_entry> loop_;
 
   // Entries that an original edge maps to. Shortcut entries never have to be
   // checked against the original graph while unpacking.

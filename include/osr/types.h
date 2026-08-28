@@ -41,6 +41,13 @@ using vecvec = cista::raw::vecvec<K, V, SizeType>;
 template <typename T>
 using vec = cista::raw::vector<T>;
 
+// Same as `vec`, but with a 64 bit size type. `vec` counts elements in 32 bit
+// and its growth silently overflows past 2^31 (next_power_of_two wraps to 0,
+// malloc(0) succeeds, and the reallocation then copies over the end), so any
+// array that can exceed two billion elements has to use this one.
+template <typename T>
+using vec64 = cista::basic_vector<T, cista::raw::ptr, false, std::uint64_t>;
+
 template <typename K, typename V>
 using vec_map = cista::raw::vector_map<K, V>;
 

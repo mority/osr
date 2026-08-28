@@ -77,7 +77,7 @@ struct cch_metric {
            std::memcmp(params_.data(), params.data(), params.size()) == 0;
   }
 
-  static cost_t decode(vec<weight_t> const& a,
+  static cost_t decode(vec64<weight_t> const& a,
                        vec<exception_t> const& ex,
                        cch_entry_idx_t const i) {
     auto const v = a[i];
@@ -103,7 +103,7 @@ struct cch_metric {
 
   // Fills one of the arrays from the costs the customization computed.
   static void compress(std::vector<cost_t> const& src,
-                       vec<weight_t>& dst,
+                       vec64<weight_t>& dst,
                        vec<exception_t>& ex) {
     dst.clear();
     dst.resize(static_cast<std::uint32_t>(src.size()));
@@ -121,7 +121,7 @@ struct cch_metric {
     }
   }
 
-  vec<weight_t> up_, dn_, loop_;
+  vec64<weight_t> up_, dn_, loop_;
   vec<exception_t> up_x_, dn_x_, loop_x_;
 
   // raw bytes of the profile parameters this metric was customized for
@@ -609,7 +609,7 @@ void customize(typename P::parameters const& params,
   // Freed one at a time: holding all three full precision arrays and the
   // compressed output at once would raise the peak by the size of the result.
   auto const compress_and_free = [](std::vector<cost_t>& src,
-                                    vec<cch_metric::weight_t>& dst,
+                                    vec64<cch_metric::weight_t>& dst,
                                     vec<cch_metric::exception_t>& ex) {
     cch_metric::compress(src, dst, ex);
     src.clear();
