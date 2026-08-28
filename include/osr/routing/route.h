@@ -100,6 +100,27 @@ std::optional<path> route_dijkstra(
     elevation_storage const* = nullptr,
     std::optional<routing_time_t> = std::nullopt);
 
+std::optional<path> route_cch(profile_parameters const&,
+                              ways const&,
+                              lookup const&,
+                              search_profile,
+                              location const& from,
+                              location const& to,
+                              match_view_t const& from_match,
+                              match_view_t const& to_match,
+                              cost_t max,
+                              direction);
+
+std::optional<path> route_cch(profile_parameters const&,
+                              ways const&,
+                              lookup const&,
+                              search_profile,
+                              location const& from,
+                              location const& to,
+                              cost_t max,
+                              direction,
+                              double max_match_distance);
+
 std::optional<path> route_astar(profile_parameters const&,
                                 ways const&,
                                 lookup const&,

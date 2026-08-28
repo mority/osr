@@ -17,6 +17,10 @@
 #include <vector>
 #include "osr/extract/extract.h"
 
+#include "osr/routing/cch/build.h"
+#include "osr/routing/cch/customize.h"
+#include "osr/routing/profiles/car.h"
+
 #include "boost/thread/tss.hpp"
 
 #include "fmt/core.h"
@@ -695,10 +699,10 @@ struct rel_ways_handler : public osmium::handler::Handler {
   rel_ways_t& rel_ways_;
 };
 
-void extract(bool const with_platforms,
-             fs::path const& in,
-             fs::path const& out,
-             fs::path const& elevation_dir) {
+void extract_ways(bool const with_platforms,
+                  fs::path const& in,
+                  fs::path const& out,
+                  fs::path const& elevation_dir) {
   auto ec = std::error_code{};
   fs::remove_all(out, ec);
   if (!fs::is_directory(out)) {
@@ -1062,6 +1066,29 @@ void extract(bool const with_platforms,
 
   pt->status("Build R-Tree").in_high(1).out_bounds(99, 100);
   lookup{w, out, cista::mmap::protection::WRITE}.build_rtree();
+}
+
+void extract(bool const with_platforms,
+             fs::path const& in,
+             fs::path const& out,
+             fs::path const& elevation_dir) {
+  extract_ways(with_platforms, in, out, elevation_dir);
+
+  // The memory mapped files are only trimmed to their final size when the
+  // writing `ways` is destructed, so the contraction hierarchy is built on a
+  // fresh read only view of the finished data.
+  auto pt = utl::get_active_progress_tracker_or_activate("osr");
+  pt->status("Contraction Hierarchy").in_high(1).out_bounds(0, 100);
+  auto const w = ways{out, cista::mmap::protection::READ};
+  auto const c = build_cch(w);
+  c->write(out);
+
+  // The car metric is the one every motorized profile falls back to and its
+  // parameters are policy constants, so it is worth storing next to the graph
+  // instead of rebuilding it in every process that routes.
+  auto m = cch_metric{};
+  customize<car>(car::parameters{}, w, *c, m);
+  m.write(out);
 }
 
 }  // namespace osr

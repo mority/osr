@@ -128,6 +128,7 @@ target_link_libraries(osr
         rtree
         tg
         unordered_dense
+        inertialflowcutter
         boost-thread
         boost-iostreams
         boost-json
@@ -140,6 +141,12 @@ target_link_libraries(osr-extract osr conf ${osr-resource-libs})
 
 add_executable(osr-benchmark exe/benchmark.cc)
 target_link_libraries(osr-benchmark osr conf ${osr-resource-libs})
+
+add_executable(osr-cch exe/cch.cc)
+target_link_libraries(osr-cch osr conf ${osr-resource-libs})
+
+add_executable(osr-compare exe/compare.cc)
+target_link_libraries(osr-compare osr conf ${osr-resource-libs})
 
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
