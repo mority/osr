@@ -43,6 +43,12 @@ struct settings : public conf::configuration {
     param(threads_, "threads,t", "query threads");
     param(max_cost_, "max_cost,m", "cost limit in seconds");
     param(seed_, "seed", "seed for the random query set");
+    param(bbox_, "bbox", "restrict both endpoints to a lat/lon box: "
+                         "min_lat,min_lon,max_lat,max_lon");
+    param(region_, "region", "label for the sampled region, used in output");
+    param(sample_only_, "sample_only",
+          "report bbox acceptance for the sampled query set and exit, without "
+          "running any query");
   }
 
   fs::path data_{"osr"};
@@ -51,6 +57,9 @@ struct settings : public conf::configuration {
   unsigned threads_{8U};
   unsigned max_cost_{43200U};
   unsigned seed_{42U};
+  std::string bbox_{};
+  std::string region_{};
+  bool sample_only_{false};
 };
 
 std::size_t read_status(char const* key) {
@@ -140,7 +149,9 @@ int main(int ac, char const** av) {
     return 1;
   }
 
-  auto const name = opt.data_.filename().string();
+  auto const name = opt.region_.empty()
+                        ? opt.data_.filename().string()
+                        : opt.data_.filename().string() + "@" + opt.region_;
   auto const algo = opt.algorithm_ == "cch" ? routing_algorithm::kCCH
                                             : routing_algorithm::kDijkstra;
   auto const max_cost = static_cast<cost_t>(opt.max_cost_);
@@ -151,13 +162,64 @@ int main(int ac, char const** av) {
   auto const params = profile_parameters{car::parameters{}};
   auto const rss_graph = rss();
 
+  // Optional geographic restriction. Sampling the same box on two different
+  // extracts is what makes them comparable: the query population is then held
+  // fixed and only the size of the hierarchy underneath it differs.
+  auto min_lat = -90.0, min_lon = -180.0, max_lat = 90.0, max_lon = 180.0;
+  auto const has_bbox = !opt.bbox_.empty();
+  if (has_bbox && std::sscanf(opt.bbox_.c_str(), "%lf,%lf,%lf,%lf", &min_lat,
+                              &min_lon, &max_lat, &max_lon) != 4) {
+    fmt::println("bad bbox {}, expected min_lat,min_lon,max_lat,max_lon",
+                 opt.bbox_);
+    return 1;
+  }
+
   auto prng = std::mt19937{opt.seed_};
   auto distr =
       std::uniform_int_distribution<std::uint32_t>{0U, w.n_nodes() - 1U};
+
+  auto const in_bbox = [&](node_idx_t const n) {
+    auto const p = w.get_node_pos(n);
+    return p.lat() >= min_lat && p.lat() <= max_lat && p.lng() >= min_lon &&
+           p.lng() <= max_lon;
+  };
+
+  // Rejection sampling. The cap only trips for a box that holds (almost) no
+  // nodes, which is a mistyped box rather than a result worth reporting.
+  auto n_rejected = std::uint64_t{0U};
+  auto const sample_node = [&](node_idx_t& out) {
+    for (auto tries = 0U; tries != 1000000U; ++tries) {
+      auto const n = node_idx_t{distr(prng)};
+      if (!has_bbox || in_bbox(n)) {
+        out = n;
+        return true;
+      }
+      ++n_rejected;
+    }
+    return false;
+  };
+
   auto from_tos = std::vector<std::pair<node_idx_t, node_idx_t>>{};
   from_tos.reserve(opt.n_queries_);
   for (auto i = 0U; i != opt.n_queries_; ++i) {
-    from_tos.emplace_back(node_idx_t{distr(prng)}, node_idx_t{distr(prng)});
+    auto a = node_idx_t{}, b = node_idx_t{};
+    if (!sample_node(a) || !sample_node(b)) {
+      fmt::println("bbox {} holds too few nodes to sample", opt.bbox_);
+      return 1;
+    }
+    from_tos.emplace_back(a, b);
+  }
+  if (has_bbox) {
+    // acceptance rate doubles as the share of the network inside the box
+    fmt::println("BBOX {} | {} | box {} | accepted {} | rejected {} | "
+                 "acceptance {:.4f}",
+                 name, opt.algorithm_, opt.bbox_, 2U * opt.n_queries_,
+                 n_rejected,
+                 static_cast<double>(2U * opt.n_queries_) /
+                     static_cast<double>(2U * opt.n_queries_ + n_rejected));
+  }
+  if (opt.sample_only_) {
+    return 0;
   }
 
   struct sample {
