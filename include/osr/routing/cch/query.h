@@ -112,6 +112,8 @@ struct cch_search {
 
   bool no_starts() const { return starts_.empty(); }
 
+  void clear_starts() { starts_.clear(); }
+
   // Stall-on-demand: a state that can be reached cheaper via a higher ranked
   // node cannot be on an up-down path, so it does not have to be expanded.
   // Measured on Hamburg it only prunes ~8% of the settled states while the
@@ -232,8 +234,52 @@ struct cch_search {
     return !max_reached_;
   }
 
+  // Mirror of `run_forward` for reverse queries: seeds the *backward* states
+  // from the starts and relaxes `dn_` arcs upward, which is the upward search
+  // of the reversed graph. A state (node, port) here carries the cost from that
+  // node, leaving by that port, to the seeded location.
+  bool run_backward(typename P::parameters const& params,
+                    ways const& w,
+                    cch const& c,
+                    cch_metric const& m,
+                    cost_t const max) {
+    auto const& r = *w.r_;
+
+    max_ = max;
+    best_ = kInfeasible;
+    meet_rank_ = cch_rank_t::invalid();
+    max_reached_ = false;
+    n_settled_ = 0U;
+    f_.clear();
+    b_.clear();
+    target_at_.clear();
+    pq_f_.clear();
+    pq_b_.clear();
+    pq_b_.n_buckets(max);
+
+    auto const turn = [&](node_idx_t const n, port_t const in,
+                          port_t const out) {
+      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
+    };
+
+    for (auto const& s : starts_) {
+      if (s.cost_ < max) {
+        relax(b_, pq_b_, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
+      }
+    }
+
+    while (!pq_b_.empty()) {
+      step<false>(r, c, m, turn);
+    }
+
+    return !max_reached_;
+  }
+
   // Per port costs of the forward search space, keyed by rank.
   map_t const& forward() const { return f_; }
+
+  // Per port costs of the backward search space, keyed by rank.
+  map_t const& backward() const { return b_; }
 
   cost_t best() const { return best_; }
   bool found() const { return meet_rank_ != cch_rank_t::invalid(); }
