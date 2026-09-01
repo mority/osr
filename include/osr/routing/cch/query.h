@@ -110,6 +110,8 @@ struct cch_search {
 
   bool empty() const { return starts_.empty() || targets_.empty(); }
 
+  bool no_starts() const { return starts_.empty(); }
+
   // Stall-on-demand: a state that can be reached cheaper via a higher ranked
   // node cannot be on an up-down path, so it does not have to be expanded.
   // Measured on Hamburg it only prunes ~8% of the settled states while the
@@ -187,6 +189,51 @@ struct cch_search {
 
     return !max_reached_;
   }
+
+  // Forward-only upward search from the starts, run to exhaustion within the
+  // cost bound. RPHAST needs the complete upward search space of the source:
+  // there is no opposite search to meet, so the bidirectional termination
+  // criterion does not apply and `best_` stays infeasible throughout. Targets
+  // are not set up at all -- the scanning phase handles the downward half.
+  bool run_forward(typename P::parameters const& params,
+                   ways const& w,
+                   cch const& c,
+                   cch_metric const& m,
+                   cost_t const max) {
+    auto const& r = *w.r_;
+
+    max_ = max;
+    best_ = kInfeasible;
+    meet_rank_ = cch_rank_t::invalid();
+    max_reached_ = false;
+    n_settled_ = 0U;
+    f_.clear();
+    b_.clear();
+    target_at_.clear();
+    pq_f_.clear();
+    pq_f_.n_buckets(max);
+    pq_b_.clear();
+
+    auto const turn = [&](node_idx_t const n, port_t const in,
+                          port_t const out) {
+      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
+    };
+
+    for (auto const& s : starts_) {
+      if (s.cost_ < max) {
+        relax(f_, pq_f_, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
+      }
+    }
+
+    while (!pq_f_.empty()) {
+      step<true>(r, c, m, turn);
+    }
+
+    return !max_reached_;
+  }
+
+  // Per port costs of the forward search space, keyed by rank.
+  map_t const& forward() const { return f_; }
 
   cost_t best() const { return best_; }
   bool found() const { return meet_rank_ != cch_rank_t::invalid(); }

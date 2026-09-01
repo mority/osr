@@ -151,7 +151,8 @@ std::vector<std::optional<path>> route(
     elevation_storage const* = nullptr,
     std::function<bool(path const&)> const& do_reconstruct =
         [](path const&) { return false; },
-    std::optional<routing_time_t> = std::nullopt);
+    std::optional<routing_time_t> = std::nullopt,
+    routing_algorithm = routing_algorithm::kDijkstra);
 
 std::optional<path> route(profile_parameters const&,
                           ways const& w,

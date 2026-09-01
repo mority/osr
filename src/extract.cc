@@ -1080,6 +1080,31 @@ void extract(bool const with_platforms,
   auto pt = utl::get_active_progress_tracker_or_activate("osr");
   pt->status("Contraction Hierarchy").in_high(1).out_bounds(0, 100);
   auto const w = ways{out, cista::mmap::protection::READ};
+
+  // An extract can legitimately contain no node that enters the hierarchy: a
+  // standalone ramp, or an input that only exercises tagging. Contracting an
+  // empty sub graph is an error, so skip the hierarchy and leave the graph
+  // without one -- readers already test `cch::exists` before using it.
+  //
+  // This is exactly the predicate `build_cch` applies, but it stops at the
+  // first hit instead of collecting every node, so on a graph that does have a
+  // hierarchy it costs nothing. Testing the ways alone is not equivalent: a way
+  // can carry hierarchy relevant properties without any node referencing it.
+  auto const has_cch_node = [&] {
+    auto const& r = *w.r_;
+    for (auto i = node_idx_t{0U}; i != node_idx_t{w.n_nodes()}; ++i) {
+      for (auto const way : r.node_ways_[i]) {
+        if (is_cch_way(r.way_properties_[way])) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }();
+  if (!has_cch_node) {
+    return;
+  }
+
   auto const c = build_cch(w);
   c->write(out);
 

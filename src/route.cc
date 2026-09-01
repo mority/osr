@@ -25,6 +25,7 @@
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/query.h"
+#include "osr/routing/cch/rphast.h"
 #include "osr/routing/cch/unpack.h"
 #include "osr/routing/dijkstra.h"
 #include "osr/routing/path_reconstruction.h"
@@ -873,6 +874,15 @@ cch_search<P>& get_cch_search() {
   return *s.get();
 }
 
+template <Profile P>
+rphast<P>& get_rphast() {
+  static auto s = boost::thread_specific_ptr<rphast<P>>{};
+  if (s.get() == nullptr) {
+    s.reset(new rphast<P>{});
+  }
+  return *s.get();
+}
+
 template <WayAwareProfile P>
 path reconstruct_cch(typename P::parameters const& params,
                      ways const& w,
@@ -1177,6 +1187,212 @@ std::optional<path> route_cch(typename P::parameters const& params,
   return std::nullopt;
 }
 
+// One-to-many over the CCH via RPHAST. The targets are selected once and the
+// upward search from the source runs once; a single sweep over the selected set
+// then yields the distance to every target at the same time.
+//
+// Distances only: reconstruction is deliberately not done here. The caller
+// learns which targets matter (a station on an optimal journey) only afterwards
+// and re-routes point to point for those few, rather than paying to unpack
+// hundreds of paths that will be discarded.
+template <Profile P>
+std::vector<std::optional<path>> route_rphast(
+    typename P::parameters const& params,
+    ways const& w,
+    cch const& c,
+    cch_metric const& m,
+    rphast<P>& rp,
+    location const& from,
+    std::vector<location> const& to,
+    match_view_t const& from_match,
+    match_result const& to_match,
+    cost_t const max,
+    direction const dir) {
+  auto result = std::vector<std::optional<path>>{};
+  result.resize(to_match.size());
+  if (from_match.empty()) {
+    return result;
+  }
+
+  auto const& r = *w.r_;
+  rp.clear();
+
+  // Selection only needs the set of target nodes, so it is done once over all
+  // candidates of all targets and stays valid for every source afterwards.
+  for (auto k = std::size_t{0U}; k != to_match.size(); ++k) {
+    auto const tm = to_match[match_idx_t{static_cast<match_idx_t::value_t>(k)}];
+    for (auto j = std::size_t{0U}; j != tm.size(); ++j) {
+      auto const dest_way = tm.way_[j];
+      auto const dest_left = tm.left(j);
+      auto const dest_right = tm.right(j);
+      for (auto const* x : {&dest_left, &dest_right}) {
+        if (!x->valid()) {
+          continue;
+        }
+        auto const way_dir = flip(opposite(dir), x->way_dir_);
+        auto const dc = P::way_cost(
+            params, r, w.timezones_, dest_way, r.way_properties_[dest_way],
+            way_dir, static_cast<distance_t>(x->dist_to_node_), std::nullopt,
+            duration_t{0}, dir);
+        if (dc.cost_ == kInfeasible || dc.cost_ >= max) {
+          continue;
+        }
+        P::resolve_all(r, x->node_, to[k].lvl_, [&](auto const node) {
+          if (!P::is_dest_reachable(params, r, w.timezones_, node, dest_way,
+                                    way_dir, dir, std::nullopt,
+                                    duration_t{0})) {
+            return;
+          }
+          rp.add_target(c, node.n_);
+        });
+      }
+    }
+  }
+  rp.select(r, c);
+
+  auto const distance_lng_degrees = geo::approx_distance_lng_degrees(from.pos_);
+  auto found = std::size_t{0U};
+  auto should_continue = true;
+
+  // Start candidates are added one at a time and the sweep re-run, mirroring
+  // how the reference Dijkstra widens its start set: the nearest match is tried
+  // first and a further one only enters if some target is still unresolved.
+  // Pooling every candidate up front instead would let a target be reached from
+  // a start the reference never considers, and answer a different question --
+  // in practice a strictly better one, which is exactly why it has to be
+  // suppressed here rather than left in.
+  for (auto i = std::size_t{0U}; i != from_match.size(); ++i) {
+    if (!should_continue && component_seen(w, from_match, i)) {
+      continue;
+    }
+    auto const start_way = from_match.way_[i];
+    auto const start_left = from_match.left(i);
+    auto const start_right = from_match.right(i);
+    for (auto const* nc : {&start_left, &start_right}) {
+      if (!nc->valid() || nc->cost_ >= max) {
+        continue;
+      }
+      auto const sc = P::way_cost(
+          params, r, w.timezones_, start_way, r.way_properties_[start_way],
+          flip(dir, nc->way_dir_),
+          static_cast<distance_t>(nc->dist_to_node_), std::nullopt,
+          duration_t{0}, dir);
+      if (sc.cost_ == kInfeasible || sc.cost_ >= max) {
+        continue;
+      }
+      P::resolve_start_node(
+          r, start_way, nc->node_, from.lvl_, dir, [&](auto const node) {
+            rp.add_start(c, node.n_, make_port(node.way_, node.dir_),
+                         sc.cost_);
+          });
+    }
+    if (rp.no_starts()) {
+      continue;
+    }
+
+    should_continue =
+        rp.run(params, w, c, m, std::max(kMinCostSettled, max)) &&
+        should_continue;
+
+    auto const start_component = r.way_component_[start_way];
+
+    for (auto k = std::size_t{0U}; k != to_match.size(); ++k) {
+      if (result[k].has_value()) {
+        continue;
+      }
+      auto const tm =
+          to_match[match_idx_t{static_cast<match_idx_t::value_t>(k)}];
+      auto const& t = to[k];
+
+      if (auto const direct = try_direct(from, t); direct.has_value()) {
+        result[k] = direct;
+        ++found;
+        continue;
+      }
+
+      auto const limit_squared_max_matching_distance =
+          geo::approx_squared_distance(from.pos_, t.pos_,
+                                       distance_lng_degrees) /
+          kMaxMatchingDistanceSquaredRatio;
+      if (std::pow(from_match.dist_to_way_[i], 2) >
+              limit_squared_max_matching_distance &&
+          i > kBottomKDefinitelyConsidered) {
+        continue;
+      }
+
+      // Which of a location's matched ways may be used is a matching question,
+      // not a routing one, and is resolved exactly as `best_candidate` does it
+      // for the reference: candidates in order, bounded by how far off the
+      // straight line the match sits, and the first way that yields any
+      // candidate decides.
+      auto component_seen_ctr = 0;
+      for (auto j = std::size_t{0U}; j != tm.size(); ++j) {
+        auto const dest_way = tm.way_[j];
+        if (start_component != r.way_component_[dest_way]) {
+          continue;
+        }
+        // Once the search has run into the cost bound, a second way in the same
+        // component is not going to be reachable either. The reference gives up
+        // here and so must this, or it would report routes the reference does
+        // not -- which it otherwise does, being the more complete of the two.
+        if (!should_continue && ++component_seen_ctr > 1) {
+          break;
+        }
+        if (std::pow(tm.dist_to_way_[j], 2) >
+                limit_squared_max_matching_distance &&
+            j > kBottomKDefinitelyConsidered) {
+          break;
+        }
+
+        auto best = kInfeasible;
+        for (auto const& x : {tm.left(j), tm.right(j)}) {
+          if (!x.valid()) {
+            continue;
+          }
+          auto const way_dir = flip(opposite(dir), x.way_dir_);
+          auto const dc = P::way_cost(
+              params, r, w.timezones_, dest_way, r.way_properties_[dest_way],
+              way_dir, static_cast<distance_t>(x.dist_to_node_), std::nullopt,
+              duration_t{0}, dir);
+          if (dc.cost_ == kInfeasible) {
+            continue;
+          }
+          P::resolve_all(r, x.node_, t.lvl_, [&](auto const node) {
+            if (!P::is_dest_reachable(params, r, w.timezones_, node, dest_way,
+                                      way_dir, dir, std::nullopt,
+                                      duration_t{0})) {
+              return;
+            }
+            auto const d = rp.get(c, node.n_, make_port(node.way_, node.dir_));
+            if (d == kInfeasible) {
+              return;
+            }
+            auto const total =
+                clamp_cost(static_cast<std::uint64_t>(d) + dc.cost_);
+            if (total < best) {
+              best = total;
+            }
+          });
+        }
+
+        if (best != kInfeasible) {
+          if (best < max) {
+            result[k] = path{.cost_ = best};
+            ++found;
+          }
+          break;
+        }
+      }
+    }
+
+    if (found == result.size()) {
+      break;
+    }
+  }
+
+  return result;
+}
+
 template <Profile P>
 std::vector<std::optional<path>> route(
     typename P::parameters const& params,
@@ -1435,15 +1651,37 @@ std::vector<std::optional<path>> route(
     sharing_data const* sharing,
     elevation_storage const* elevations,
     std::function<bool(path const&)> const& do_reconstruct,
-    std::optional<routing_time_t> const start_time) {
+    std::optional<routing_time_t> const start_time,
+    routing_algorithm const algo) {
   if (from_match.empty()) {
     return std::vector<std::optional<path>>(to.size());
   }
-  return with_profile(profile, [&]<Profile P>(P&&) {
-    return route(std::get<typename P::parameters>(params), w, l,
-                 get_dijkstra<P>(), from, to, from_match, to_match, max, dir,
-                 start_time, blocked, sharing, elevations, do_reconstruct);
-  });
+  return with_profile(
+      profile, [&]<Profile P>(P&&) -> std::vector<std::optional<path>> {
+        if (algo == routing_algorithm::kCCH) {
+          if constexpr (WayAwareProfile<P> &&
+                        requires(typename P::parameters const& pp) {
+                          pp.uturn_penalty_;
+                        }) {
+            auto const* c = get_cch_registry().get(w.p_);
+            utl::verify(c != nullptr, "no cch found in {}", w.p_);
+            auto const& pp = std::get<typename P::parameters>(params);
+            auto const blob = params_blob(pp);
+            auto const m = get_cch_registry().metric(
+                w.p_, profile, blob,
+                [&](cch_metric& out) { customize<P>(pp, w, *c, out); });
+            return route_rphast<P>(pp, w, *c, *m, get_rphast<P>(), from, to,
+                                   from_match, to_match, max, dir);
+          } else {
+            throw utl::fail("cch not supported for profile {}",
+                            to_str(profile));
+          }
+        }
+        return route(std::get<typename P::parameters>(params), w, l,
+                     get_dijkstra<P>(), from, to, from_match, to_match, max,
+                     dir, start_time, blocked, sharing, elevations,
+                     do_reconstruct);
+      });
 }
 
 

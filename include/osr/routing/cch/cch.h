@@ -104,8 +104,12 @@ struct cch {
     return n < rank_.size() && rank_[n] != cch_rank_t::invalid();
   }
 
+  // These CSR accessors take the base pointer as `data() + ofs` rather than
+  // `&vec[ofs]`: for the last entry `ofs` equals `size()`, and forming a
+  // reference to the one-past-the-end element trips cista's bounds check in
+  // debug builds even though the resulting span is empty.
   std::span<cch_rank_t const> upper(cch_rank_t const r) const {
-    return {&adj_head_[adj_ofs_[r]], adj_ofs_[r + 1U] - adj_ofs_[r]};
+    return {adj_head_.data() + adj_ofs_[r], adj_ofs_[r + 1U] - adj_ofs_[r]};
   }
 
   cch_slot_idx_t upper_begin(cch_rank_t const r) const { return adj_ofs_[r]; }
@@ -114,15 +118,16 @@ struct cch {
   }
 
   std::span<std::uint32_t const> lower_slots(cch_rank_t const r) const {
-    return {&lower_slot_[lower_ofs_[r]], lower_ofs_[r + 1U] - lower_ofs_[r]};
+    return {lower_slot_.data() + lower_ofs_[r],
+            lower_ofs_[r + 1U] - lower_ofs_[r]};
   }
 
   std::span<cch_entry const> up_entries(cch_slot_idx_t const s) const {
-    return {&up_[up_ofs_[s]], up_ofs_[s + 1U] - up_ofs_[s]};
+    return {up_.data() + up_ofs_[s], up_ofs_[s + 1U] - up_ofs_[s]};
   }
 
   std::span<cch_entry const> dn_entries(cch_slot_idx_t const s) const {
-    return {&dn_[dn_ofs_[s]], dn_ofs_[s + 1U] - dn_ofs_[s]};
+    return {dn_.data() + dn_ofs_[s], dn_ofs_[s + 1U] - dn_ofs_[s]};
   }
 
   // Self loops: a path that leaves a node and comes back to it. They are the
@@ -130,7 +135,7 @@ struct cch {
   // through an intersection whose direct turn is forbidden. Without them the
   // hierarchy would not preserve all shortest paths.
   std::span<cch_entry const> loop_entries(cch_rank_t const r) const {
-    return {&loop_[loop_ofs_[r]], loop_ofs_[r + 1U] - loop_ofs_[r]};
+    return {loop_.data() + loop_ofs_[r], loop_ofs_[r + 1U] - loop_ofs_[r]};
   }
 
   cch_entry_idx_t loop_begin(cch_rank_t const r) const { return loop_ofs_[r]; }

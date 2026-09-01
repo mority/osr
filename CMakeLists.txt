@@ -111,6 +111,16 @@ endif ()
 # --- LIB ---
 file(GLOB_RECURSE osr-src src/*.cc)
 add_library(osr ${osr-src})
+
+# GCC 13 mis-analyses the vector growth in `contractor::push_loop` and reports a
+# write past a zero sized object, deriving a capacity of 2^63-2 and a negative
+# offset -- a false positive on `emplace_back` of a two byte element (GCC PR
+# 109849). It is only emitted at -O2, so Release built cleanly while
+# RelWithDebInfo failed on -Werror. Scoped to the one file that trips it.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set_source_files_properties(src/routing/cch/build.cc
+      PROPERTIES COMPILE_OPTIONS "-Wno-stringop-overflow")
+endif ()
 target_include_directories(osr PUBLIC include)
 target_compile_features(osr PUBLIC cxx_std_23)
 target_compile_options(osr PRIVATE ${osr-compile-options})
@@ -150,6 +160,9 @@ target_link_libraries(osr-compare osr conf ${osr-resource-libs})
 
 add_executable(osr-cch-benchmark exe/cch_benchmark.cc)
 target_link_libraries(osr-cch-benchmark osr conf ${osr-resource-libs})
+
+add_executable(osr-rphast-probe exe/rphast_probe.cc)
+target_link_libraries(osr-rphast-probe osr conf ${osr-resource-libs})
 
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
