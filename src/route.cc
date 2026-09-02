@@ -1,6 +1,7 @@
 #include "osr/routing/route.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #include <algorithm>
 #include <optional>
@@ -24,6 +25,7 @@
 #include "osr/routing/bidirectional.h"
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
+#include "osr/routing/cch/lazy_rphast.h"
 #include "osr/routing/cch/query.h"
 #include "osr/routing/cch/rphast.h"
 #include "osr/routing/cch/unpack.h"
@@ -875,6 +877,15 @@ cch_search<P>& get_cch_search() {
 }
 
 template <Profile P>
+lazy_rphast<P>& get_lazy_rphast() {
+  static auto s = boost::thread_specific_ptr<lazy_rphast<P>>{};
+  if (s.get() == nullptr) {
+    s.reset(new lazy_rphast<P>{});
+  }
+  return *s.get();
+}
+
+template <Profile P>
 rphast<P>& get_rphast() {
   static auto s = boost::thread_specific_ptr<rphast<P>>{};
   if (s.get() == nullptr) {
@@ -1195,6 +1206,15 @@ std::optional<path> route_cch(typename P::parameters const& params,
 // learns which targets matter (a station on an optimal journey) only afterwards
 // and re-routes point to point for those few, rather than paying to unpack
 // hundreds of paths that will be discarded.
+namespace {
+
+bool lazy_rphast_enabled() {
+  static auto const on = std::getenv("OSR_LAZY_RPHAST") != nullptr;
+  return on;
+}
+
+}  // namespace
+
 template <Profile P>
 std::vector<std::optional<path>> route_rphast(
     typename P::parameters const& params,
@@ -1202,6 +1222,7 @@ std::vector<std::optional<path>> route_rphast(
     cch const& c,
     cch_metric const& m,
     rphast<P>& rp,
+    lazy_rphast<P>& lz,
     location const& from,
     std::vector<location> const& to,
     match_view_t const& from_match,
@@ -1215,11 +1236,19 @@ std::vector<std::optional<path>> route_rphast(
   }
 
   auto const& r = *w.r_;
-  rp.clear();
+  auto const lazy = lazy_rphast_enabled();
+  auto const backward = dir == direction::kBackward;
+  if (lazy) {
+    lz.clear();
+  } else {
+    rp.clear();
+  }
 
   // Selection only needs the set of target nodes, so it is done once over all
   // candidates of all targets and stays valid for every source afterwards.
-  for (auto k = std::size_t{0U}; k != to_match.size(); ++k) {
+  // Lazy RPHAST has no selection phase, and this loop has no other effect, so
+  // it is skipped entirely -- not paying for it is part of the point.
+  for (auto k = std::size_t{0U}; !lazy && k != to_match.size(); ++k) {
     auto const tm = to_match[match_idx_t{static_cast<match_idx_t::value_t>(k)}];
     for (auto j = std::size_t{0U}; j != tm.size(); ++j) {
       auto const dest_way = tm.way_[j];
@@ -1248,7 +1277,9 @@ std::vector<std::optional<path>> route_rphast(
       }
     }
   }
-  rp.select(r, c, /* pack */ false, dir == direction::kBackward);
+  if (!lazy) {
+    rp.select(r, c, /* pack */ false, backward);
+  }
 
   auto const distance_lng_degrees = geo::approx_distance_lng_degrees(from.pos_);
   auto found = std::size_t{0U};
@@ -1282,17 +1313,22 @@ std::vector<std::optional<path>> route_rphast(
       }
       P::resolve_start_node(
           r, start_way, nc->node_, from.lvl_, dir, [&](auto const node) {
-            rp.add_start(c, node.n_, make_port(node.way_, node.dir_),
-                         sc.cost_);
+            auto const p = make_port(node.way_, node.dir_);
+            if (lazy) {
+              lz.add_start(c, node.n_, p, sc.cost_);
+            } else {
+              rp.add_start(c, node.n_, p, sc.cost_);
+            }
           });
     }
-    if (rp.no_starts()) {
+    if (lazy ? lz.no_starts() : rp.no_starts()) {
       continue;
     }
 
-    should_continue =
-        rp.run(params, w, c, m, std::max(kMinCostSettled, max)) &&
-        should_continue;
+    auto const bound = std::max(kMinCostSettled, max);
+    should_continue = (lazy ? lz.run(params, w, c, m, bound, backward)
+                            : rp.run(params, w, c, m, bound)) &&
+                      should_continue;
 
     auto const start_component = r.way_component_[start_way];
 
@@ -1363,7 +1399,9 @@ std::vector<std::optional<path>> route_rphast(
                                       duration_t{0})) {
               return;
             }
-            auto const d = rp.get(c, node.n_, make_port(node.way_, node.dir_));
+            auto const tp = make_port(node.way_, node.dir_);
+            auto const d = lazy ? lz.get(params, w, c, m, node.n_, tp)
+                                : rp.get(c, node.n_, tp);
             if (d == kInfeasible) {
               return;
             }
@@ -1399,6 +1437,7 @@ std::vector<std::optional<path>> route_rphast(
       break;
     }
   }
+
 
   return result;
 }
@@ -1680,8 +1719,9 @@ std::vector<std::optional<path>> route(
             auto const m = get_cch_registry().metric(
                 w.p_, profile, blob,
                 [&](cch_metric& out) { customize<P>(pp, w, *c, out); });
-            return route_rphast<P>(pp, w, *c, *m, get_rphast<P>(), from, to,
-                                   from_match, to_match, max, dir);
+            return route_rphast<P>(pp, w, *c, *m, get_rphast<P>(),
+                                   get_lazy_rphast<P>(), from, to, from_match,
+                                   to_match, max, dir);
           } else {
             throw utl::fail("cch not supported for profile {}",
                             to_str(profile));

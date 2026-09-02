@@ -164,6 +164,9 @@ target_link_libraries(osr-cch-benchmark osr conf ${osr-resource-libs})
 add_executable(osr-rphast-probe exe/rphast_probe.cc)
 target_link_libraries(osr-rphast-probe osr conf ${osr-resource-libs})
 
+add_executable(osr-lazy-rphast-benchmark exe/lazy_rphast_benchmark.cc)
+target_link_libraries(osr-lazy-rphast-benchmark osr conf ${osr-resource-libs})
+
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
 target_link_libraries(osr-backend osr web-server conf boost-json ${osr-resource-libs})
