@@ -164,6 +164,15 @@ target_link_libraries(osr-cch-benchmark osr conf ${osr-resource-libs})
 add_executable(osr-rphast-probe exe/rphast_probe.cc)
 target_link_libraries(osr-rphast-probe osr conf ${osr-resource-libs})
 
+add_executable(osr-station-benchmark exe/station_benchmark.cc)
+target_link_libraries(osr-station-benchmark osr conf ${osr-resource-libs})
+
+add_executable(osr-extract-only exe/extract_only.cc)
+target_link_libraries(osr-extract-only osr conf ${osr-resource-libs})
+
+add_executable(osr-cch-info exe/cch_info.cc)
+target_link_libraries(osr-cch-info osr conf ${osr-resource-libs})
+
 add_executable(osr-lazy-rphast-benchmark exe/lazy_rphast_benchmark.cc)
 target_link_libraries(osr-lazy-rphast-benchmark osr conf ${osr-resource-libs})
 

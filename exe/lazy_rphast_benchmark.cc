@@ -33,6 +33,9 @@
 
 #include "conf/options_parser.h"
 
+#include "geo/box.h"
+
+#include "osr/lookup.h"
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/lazy_rphast.h"
@@ -132,6 +135,10 @@ int main(int ac, char const** av) {
   }
 
   auto const w = ways{opt.data_, cista::mmap::protection::READ};
+  // The rtree, not rejection sampling: at continental scale the chance of a
+  // uniformly drawn node landing in a 40 km box is far too small to sample
+  // target sets that way.
+  auto const l = lookup{w, opt.data_, cista::mmap::protection::READ};
   auto const c = cch::read(opt.data_);
   auto const params = car::parameters{};
 
@@ -175,6 +182,8 @@ int main(int ac, char const** av) {
   };
 
   auto const deg_lat = opt.radius_km_ / 111.2;
+  auto candidates = std::vector<node_idx_t>{};
+  auto seen = hash_set<node_idx_t>{};
 
   fmt::println(
       "\n{:>8} {:>10} {:>10} {:>9} {:>10} {:>10} {:>12} {:>12}", "targets",
@@ -205,22 +214,24 @@ int main(int ac, char const** av) {
 
       // Targets drawn from a box around the source, which is what a first/last
       // mile target set looks like: near the source, not spread over the map.
-      auto targets = std::vector<node_idx_t>{};
-      targets.reserve(k);
-      for (auto tries = 0U; tries != k * 200U && targets.size() != k; ++tries) {
-        auto const n = node_idx_t{distr(prng)};
-        if (!c->contains(n)) {
-          continue;
+      auto box = geo::box{};
+      box.extend(geo::latlng{sp.lat() - deg_lat, sp.lng() - deg_lon});
+      box.extend(geo::latlng{sp.lat() + deg_lat, sp.lng() + deg_lon});
+      candidates.clear();
+      seen.clear();
+      l.find(box, [&](way_idx_t const way) {
+        for (auto const n : w.r_->way_nodes_[way]) {
+          if (c->contains(n) && seen.emplace(n).second) {
+            candidates.push_back(n);
+          }
         }
-        auto const p = w.get_node_pos(n);
-        if (p.lat() >= sp.lat() - deg_lat && p.lat() <= sp.lat() + deg_lat &&
-            p.lng() >= sp.lng() - deg_lon && p.lng() <= sp.lng() + deg_lon) {
-          targets.push_back(n);
-        }
-      }
-      if (targets.size() < k) {
+      });
+      if (candidates.size() < k) {
         continue;
       }
+      std::shuffle(begin(candidates), end(candidates), prng);
+      auto targets =
+          std::vector<node_idx_t>(begin(candidates), begin(candidates) + k);
 
       // Both arms read the same prefix. Eager still has to select and sweep
       // the closure of the *whole* target set, because it cannot know in
