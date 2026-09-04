@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "utl/helpers/algorithm.h"
+#include "utl/parallel_for.h"
 #include "utl/progress_tracker.h"
 #include "utl/timer.h"
 #include "utl/verify.h"
@@ -67,6 +68,65 @@ struct arc_rec {
   port_t p_;  // entry port at the tail node
   port_t q_;  // exit port at the head node
 };
+
+// One neighbor's entries, grouped by the port at the *far* node.
+//
+// A record the contraction pushes only keeps the two far ports -- the ports at
+// the node being contracted are consumed by the turn check and then thrown
+// away. Enumerating the entry lists pairwise therefore produces the same
+// record over and over: on Germany 27.6 billion records collapse to 3.0
+// billion distinct ones, and the nine duplicates out of ten are pushed,
+// radix sorted, merged and dropped again. Grouping first turns the inner
+// product into one record per pair of far ports.
+//
+// `mask_` holds the ports at the contracted node that go with `port_`: for an
+// outgoing group the departure ports as they are, for an incoming group the
+// *closure* of the arrival ports under `allowed_`, so that testing a pair is a
+// single and. `wide_` marks a group that contains a port beyond `kMaxPorts`,
+// which has no bit in either mask -- such a group is treated as reachable,
+// which can only add arcs, never lose one.
+struct port_group {
+  port_t port_;
+  bool wide_;
+  std::uint32_t mask_;
+};
+
+// Everything the contraction of one node needs besides its own arc list. One
+// per thread on a wide level, one per node on a narrow one -- the buffers are
+// reused, so a node pays no allocation for them.
+struct node_scratch {
+  std::vector<cch_rank_t::value_t> neighbors_;
+  std::vector<std::vector<cch_entry>> in_of_, out_of_;
+  std::vector<port_group> in_grp_, out_grp_;
+  std::vector<std::uint32_t> in_ofs_, out_ofs_;
+
+  // Scratch for grouping an outgoing entry list by its far port: those lists
+  // are sorted by the *near* port, so the groups are not contiguous. Indexed
+  // by the full `port_t` range so that a node with more than `kMaxPorts / 2`
+  // ways cannot run off the end. Bit 32 marks a group as wide, bit 33 marks it
+  // as used, so that a group whose mask is empty is still found.
+  static constexpr auto const kSeenBit = std::uint64_t{1U} << 33U;
+  static constexpr auto const kWideBit = std::uint64_t{1U} << 32U;
+  std::array<std::uint64_t, 256U> acc_{};
+  std::vector<port_t> touched_;
+
+  std::array<std::uint32_t, kMaxPorts> reach_{};
+  std::array<std::uint32_t, kMaxPorts> allowed_{};
+  bool allowed_all_{false};
+
+  std::span<port_group const> in_group(std::size_t const k) const {
+    return {in_grp_.data() + in_ofs_[k], in_ofs_[k + 1U] - in_ofs_[k]};
+  }
+  std::span<port_group const> out_group(std::size_t const k) const {
+    return {out_grp_.data() + out_ofs_[k], out_ofs_[k + 1U] - out_ofs_[k]};
+  }
+};
+
+// Stripe lock over the target lists. A target is written by one node at a
+// time, but two nodes of the same level can share one, so `process_target`
+// holds the stripe of its target for the whole call -- one acquisition per
+// (node, neighbor) pair rather than one per record.
+constexpr auto const kLockStripes = std::size_t{4096U};
 
 // Workers for the contraction, created once instead of per node.
 //
@@ -171,6 +231,81 @@ private:
   bool stop_{false};
 };
 
+// Groups the ranks by their level in the elimination tree.
+//
+// The parent of a node is the lowest ranked of its upper neighbours in the
+// *filled* graph, which Liu's algorithm derives from the original graph alone:
+// walking the ranks in order and merging every lower neighbour's component
+// into the current node makes the root of a component the node that will
+// absorb it. That needs no fill-in, only a union find with path compression.
+//
+// The level of a node is its height in that tree. A node's lower neighbours in
+// the filled graph are exactly the tree descendants it is adjacent to, so
+// their height is smaller -- the height of a node is one more than the largest
+// height among its lower neighbours, which is the same level `customize()`
+// computes on the finished hierarchy.
+std::vector<std::vector<cch_rank_t::value_t>> compute_levels(
+    nd_graph const& g, std::vector<std::uint32_t> const& order) {
+  auto const n = static_cast<cch_rank_t::value_t>(order.size());
+  constexpr auto const kNoParent = std::numeric_limits<std::uint32_t>::max();
+
+  auto rank_of = std::vector<std::uint32_t>(n);
+  for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+    rank_of[order[i]] = i;
+  }
+
+  auto ancestor = std::vector<std::uint32_t>(n);
+  auto parent = std::vector<std::uint32_t>(n, kNoParent);
+  for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+    ancestor[i] = i;
+    for (auto const l : g.adj(order[i])) {
+      auto const j = rank_of[l];
+      if (j >= i) {
+        continue;
+      }
+      auto root = j;
+      while (ancestor[root] != root) {
+        root = ancestor[root];
+      }
+      for (auto x = j; ancestor[x] != root;) {
+        auto const next = ancestor[x];
+        ancestor[x] = root;
+        x = next;
+      }
+      if (root != i) {
+        parent[root] = i;
+        ancestor[root] = i;
+      }
+    }
+  }
+
+  // Pushed forward rather than pulled: the parent of a node has a larger rank,
+  // so walking the ranks in order reaches a node only after all of its
+  // children are final.
+  auto height = std::vector<std::uint32_t>(n, 0U);
+  auto max_height = std::uint32_t{0U};
+  for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+    max_height = std::max(max_height, height[i]);
+    if (parent[i] != kNoParent) {
+      height[parent[i]] = std::max(height[parent[i]], height[i] + 1U);
+    }
+  }
+
+  auto by_level =
+      std::vector<std::vector<cch_rank_t::value_t>>(max_height + 1U);
+  auto cnt = std::vector<std::uint32_t>(max_height + 1U, 0U);
+  for (auto const h : height) {
+    ++cnt[h];
+  }
+  for (auto h = std::uint32_t{0U}; h != by_level.size(); ++h) {
+    by_level[h].reserve(cnt[h]);
+  }
+  for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+    by_level[height[i]].emplace_back(i);
+  }
+  return by_level;
+}
+
 struct contractor {
   contractor(ways const& w, cch& c, unsigned const n_threads)
       : r_{*w.r_},
@@ -179,9 +314,6 @@ struct contractor {
                        ? std::max(1U, std::thread::hardware_concurrency())
                        : n_threads},
         pool_{n_threads_ - 1U} {}
-
-  // Below this degree the threads cost more than the pairs they split.
-  static constexpr auto const kMinParallelDegree = std::size_t{32U};
 
   bool turn_ok(node_idx_t const n, port_t const in, port_t const out) const {
     return !is_restricted_for_all(r_, n, port_way_pos(in), port_way_pos(out));
@@ -275,9 +407,11 @@ struct contractor {
   // Reachability between the *arriving* ports of `n` using its self loops:
   // bit q of reach[i] is set if we can arrive at `n` with port q after having
   // arrived with port i and driven one or more loops.
-  void build_reach(node_idx_t const n,
+  void build_reach(node_scratch& s,
+                   node_idx_t const n,
                    std::span<cch_entry const> loops,
                    port_t const ports) {
+    auto& reach_ = s.reach_;
     reach_.fill(0U);
     for (auto i = port_t{0U}; i != ports; ++i) {
       reach_[i] = std::uint32_t{1U} << i;
@@ -313,18 +447,52 @@ struct contractor {
     }
   }
 
-  bool turn_reachable(node_idx_t const n,
-                      port_t const in,
-                      port_t const out) const {
-    auto rest = reach_[in];
-    while (rest != 0U) {
-      auto const k = static_cast<port_t>(std::countr_zero(rest));
-      rest &= rest - 1U;
-      if (turn_ok(n, k, out)) {
-        return true;
+  // `allowed_[i]`: the departure ports that can be reached from arrival port
+  // `i`, driving zero or more of the node's self loops on the way. This is the
+  // per pair `turn_reachable` test of the old contraction hoisted out of the
+  // record loop: it is evaluated once per node instead of 27.6 billion times.
+  //
+  // A node without a turn restriction permits every turn, so its table is all
+  // ones and neither the loop closure nor `is_restricted_for_all` is needed --
+  // that is 99.2% of the nodes.
+  void build_allowed(node_scratch& s,
+                     node_idx_t const n,
+                     std::span<cch_entry const> loops,
+                     port_t const ports) {
+    auto& allowed_ = s.allowed_;
+    if (!r_.node_is_restricted_[n]) {
+      if (!s.allowed_all_) {
+        allowed_.fill(std::numeric_limits<std::uint32_t>::max());
+        s.allowed_all_ = true;
+      }
+      return;
+    }
+    s.allowed_all_ = false;
+
+    build_reach(s, n, loops, ports);
+
+    auto ok = std::array<std::uint32_t, kMaxPorts>{};
+    for (auto k = port_t{0U}; k != ports; ++k) {
+      for (auto o = port_t{0U}; o != ports; ++o) {
+        if (turn_ok(n, k, o)) {
+          ok[k] |= std::uint32_t{1U} << o;
+        }
       }
     }
-    return false;
+
+    allowed_.fill(0U);
+    for (auto i = port_t{0U}; i != ports; ++i) {
+      auto rest = s.reach_[i];
+      while (rest != 0U) {
+        auto const k = static_cast<port_t>(std::countr_zero(rest));
+        rest &= rest - 1U;
+        allowed_[i] |= ok[k];
+      }
+    }
+  }
+
+  static bool reachable(port_group const& in, port_group const& out) {
+    return in.wide_ || out.wide_ || (in.mask_ & out.mask_) != 0U;
   }
 
   void push(cch_rank_t::value_t const at, arc_rec const a) {
@@ -337,155 +505,329 @@ struct contractor {
     }
   }
 
-  void contract() {
+  // Prepares one node: makes its arc list final and groups it by neighbor.
+  // No global state is touched, so every node of a level can run this at the
+  // same time -- a node is never a neighbor of another node of its own level,
+  // so nothing can still be pushed into its list.
+  void prepare(cch_rank_t::value_t const i, node_scratch& s) {
+    auto const node = c_.order_[cch_rank_t{i}];
+
+    auto& v = adj_[i];
+    dedup_tail(v, clean_size_[i]);
+    clean_size_[i] = v.size();
+
+    auto& lp = loops_[i];
+    dedup(lp);
+    auto const ports = std::min(n_ports(r_, node), kMaxPorts);
+    build_allowed(s, node, std::span<cch_entry const>{lp}, ports);
+
+    // group the arc records by neighbor. The inner lists are reused instead
+    // of rebuilt: at 15 million nodes their allocation is measurable.
+    //
+    // The row this node contributes to the CSR is counted on the way: the
+    // records are already being walked here, and `write_csr` would otherwise
+    // have to walk all 1.8 GB of them once more just to size its arrays.
+    s.neighbors_.clear();
+    auto n_up = cch_entry_idx_t{0U};
+    auto n_dn = cch_entry_idx_t{0U};
+    auto k = std::size_t{0U};
+    for (auto it = begin(v); it != end(v); ++k) {
+      auto const other = it->other_;
+      s.neighbors_.emplace_back(other);
+      if (s.in_of_.size() == k) {
+        s.in_of_.emplace_back();
+        s.out_of_.emplace_back();
+      }
+      auto& in = s.in_of_[k];
+      auto& out = s.out_of_[k];
+      in.clear();
+      out.clear();
+      for (; it != end(v) && it->other_ == other; ++it) {
+        (it->out_ != 0U ? out : in).emplace_back(cch_entry{it->p_, it->q_});
+      }
+      n_up += out.size();
+      n_dn += in.size();
+    }
+    auto const rank = cch_rank_t{i};
+    c_.adj_ofs_[rank + 1U] = static_cast<cch_slot_idx_t>(k);
+    c_.loop_ofs_[rank + 1U] = lp.size();
+    up_base_[i + 1U] = n_up;
+    dn_base_[i + 1U] = n_dn;
+
+    // group both entry lists of every neighbor by their far port
+    s.in_grp_.clear();
+    s.out_grp_.clear();
+    s.in_ofs_.clear();
+    s.out_ofs_.clear();
+    for (auto j = std::size_t{0U}; j != s.neighbors_.size(); ++j) {
+      s.in_ofs_.emplace_back(static_cast<std::uint32_t>(s.in_grp_.size()));
+      s.out_ofs_.emplace_back(static_cast<std::uint32_t>(s.out_grp_.size()));
+
+      // incoming: sorted by the far port, so the groups are runs. The mask is
+      // the closure of the arrival ports, which makes the pair test an and
+      // against the departure ports of an outgoing group.
+      auto const& in = s.in_of_[j];
+      for (auto it = begin(in); it != end(in);) {
+        auto const far = it->entry_;
+        auto mask = std::uint32_t{0U};
+        auto wide = false;
+        for (; it != end(in) && it->entry_ == far; ++it) {
+          if (it->exit_ < kMaxPorts) {
+            mask |= s.allowed_[it->exit_];
+          } else {
+            wide = true;
+          }
+        }
+        s.in_grp_.emplace_back(port_group{far, wide, mask});
+      }
+
+      // outgoing: sorted by the near port, so the groups are collected in
+      // `acc_` and read back in the order they were first seen
+      s.touched_.clear();
+      for (auto const& e : s.out_of_[j]) {
+        auto& a = s.acc_[e.exit_];
+        if (a == 0U) {
+          s.touched_.emplace_back(e.exit_);
+        }
+        a |= node_scratch::kSeenBit |
+             (e.entry_ < kMaxPorts ? std::uint64_t{1U} << e.entry_
+                                   : node_scratch::kWideBit);
+      }
+      for (auto const far : s.touched_) {
+        auto const a = s.acc_[far];
+        s.acc_[far] = 0U;
+        s.out_grp_.emplace_back(
+            port_group{far, (a & node_scratch::kWideBit) != 0U,
+                       static_cast<std::uint32_t>(a & 0xFFFFFFFFU)});
+      }
+    }
+    s.in_ofs_.emplace_back(static_cast<std::uint32_t>(s.in_grp_.size()));
+    s.out_ofs_.emplace_back(static_cast<std::uint32_t>(s.out_grp_.size()));
+  }
+
+  // Connects the neighbors of a contracted node that meet at `k`. `k == b`
+  // creates a self loop, i.e. the shortcut of turning around at this node.
+  //
+  // Every arc is pushed to the lower ranked of its two ends, so the pairs are
+  // enumerated per *target* instead of as a full matrix: the neighbor `k`
+  // collects the pairs whose lower end it is. All of a call's writes therefore
+  // go to one target list, which one stripe lock covers.
+  void process_target(node_scratch const& s, std::size_t const k) {
+    auto const& neighbors = s.neighbors_;
+    auto const t = neighbors[k];
+    auto const in_k = s.in_group(k);
+    auto const out_k = s.out_group(k);
+    if (in_k.empty() && out_k.empty()) {
+      return;
+    }
+
+    auto const lock = std::lock_guard{target_locks_[t % kLockStripes]};
+
+    // pairs (k, b): this node is the tail, so it owns them if t < y
+    if (!in_k.empty()) {
+      for (auto b = std::size_t{0U}; b != neighbors.size(); ++b) {
+        auto const out_b = s.out_group(b);
+        if (out_b.empty()) {
+          continue;
+        }
+        auto const y = neighbors[b];
+        if (b != k && t >= y) {
+          continue;  // owned by `b`
+        }
+        for (auto const& g1 : in_k) {
+          for (auto const& g2 : out_b) {
+            if (!reachable(g1, g2)) {
+              continue;
+            }
+            if (b == k) {
+              push_loop(t, cch_entry{g1.port_, g2.port_});
+            } else {
+              push(t, arc_rec{y, 1U, g1.port_, g2.port_});
+            }
+          }
+        }
+      }
+    }
+
+    // pairs (a, k): this node is the head, so it owns them if t < x
+    if (!out_k.empty()) {
+      for (auto a = std::size_t{0U}; a != neighbors.size(); ++a) {
+        if (a == k) {
+          continue;
+        }
+        auto const in_a = s.in_group(a);
+        if (in_a.empty()) {
+          continue;
+        }
+        auto const x = neighbors[a];
+        if (x <= t) {
+          continue;  // owned by `a`
+        }
+        for (auto const& g1 : in_a) {
+          for (auto const& g2 : out_k) {
+            if (!reachable(g1, g2)) {
+              continue;
+            }
+            push(t, arc_rec{x, 0U, g1.port_, g2.port_});
+          }
+        }
+      }
+    }
+  }
+
+  // Contracts the hierarchy level by level.
+  //
+  // The contraction order is a valid order, but so is any order that finishes
+  // a level before it starts the next one: a node only ever pushes into the
+  // list of a node on a larger level, so within a level the nodes are
+  // independent of each other. That is what makes the *whole* per node cost
+  // parallel -- deduplicating the arc list, grouping it and enumerating the
+  // pairs -- and not just the pairs of the few dense nodes.
+  //
+  // Most of the work sits in the few, very dense levels at the top, and those
+  // cannot be spread over their nodes. They are spread over the (node,
+  // neighbor) pairs instead, which needs the whole level's grouping to be held
+  // at once -- hence the cutoff, the same one `customize()` uses.
+  static constexpr auto const kMaxNodeParallelLevel = std::size_t{1024U};
+
+  void contract(std::vector<std::vector<cch_rank_t::value_t>> const& by_level) {
     auto const n = c_.n_ranks();
 
     auto pt = utl::get_active_progress_tracker_or_activate("osr");
-    // The bar advances by rank, which is the only counter available here.
-    // Be aware that it is optimistic: the work per node grows with its degree
-    // and the highest ranked nodes are by far the densest, so the last few
-    // percent of the ranks are most of the time.
     pt->status("CCH Contraction")
         .reset_bounds()
-        .out_bounds(8.0F, 97.0F)
+        .out_bounds(8.0F, 90.0F)
         .in_high(n);
 
-    c_.adj_ofs_.resize(n + 1U);
-    c_.loop_ofs_.resize(n + 1U);
-    c_.up_ofs_.emplace_back(0U);
-    c_.dn_ofs_.emplace_back(0U);
+    auto done = std::size_t{0U};
+    for (auto const& lvl : by_level) {
+      if (n_threads_ == 1U || lvl.size() == 1U) {
+        static thread_local auto s = node_scratch{};
+        for (auto const rank : lvl) {
+          prepare(rank, s);
+          for (auto k = std::size_t{0U}; k != s.neighbors_.size(); ++k) {
+            process_target(s, k);
+          }
+        }
+      } else if (lvl.size() > kMaxNodeParallelLevel) {
+        // wide level: one job per node, every worker reusing its scratch
+        pool_.run(lvl.size(), [&](std::size_t const i) {
+          static thread_local auto s = node_scratch{};
+          prepare(lvl[i], s);
+          for (auto k = std::size_t{0U}; k != s.neighbors_.size(); ++k) {
+            process_target(s, k);
+          }
+        });
+      } else {
+        // narrow level: group every node first, then one job per neighbor
+        if (level_scratch_.size() < lvl.size()) {
+          level_scratch_.resize(lvl.size());
+        }
+        pool_.run(lvl.size(), [&](std::size_t const i) {
+          prepare(lvl[i], level_scratch_[i]);
+        });
 
-    auto in_of = std::vector<std::vector<cch_entry>>{};
-    auto out_of = std::vector<std::vector<cch_entry>>{};
-    auto neighbors = std::vector<cch_rank_t::value_t>{};
-
-    for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
-      auto const r = cch_rank_t{i};
-      auto const node = c_.order_[r];
-      c_.adj_ofs_[r] = static_cast<cch_slot_idx_t>(c_.adj_head_.size());
-      c_.loop_ofs_[r] = static_cast<cch_entry_idx_t>(c_.loop_.size());
-
-      auto& v = adj_[i];
-      dedup_tail(v, clean_size_[i]);
-
-      auto& lp = loops_[i];
-      dedup(lp);
-      for (auto const& e : lp) {
-        c_.loop_.emplace_back(e);
+        slot_jobs_.clear();
+        for (auto i = std::uint32_t{0U}; i != lvl.size(); ++i) {
+          for (auto k = std::uint32_t{0U};
+               k != level_scratch_[i].neighbors_.size(); ++k) {
+            slot_jobs_.emplace_back(i, k);
+          }
+        }
+        pool_.run(slot_jobs_.size(), [&](std::size_t const j) {
+          auto const [i, k] = slot_jobs_[j];
+          process_target(level_scratch_[i], k);
+        });
       }
-      auto const ports = std::min(n_ports(r_, node), kMaxPorts);
-      build_reach(node, std::span<cch_entry const>{lp}, ports);
-      lp.clear();
-      lp.shrink_to_fit();
 
-      // group the arc records by neighbor
-      neighbors.clear();
-      in_of.clear();
-      out_of.clear();
+      done += lvl.size();
+      pt->update_monotonic(done);
+    }
+
+    write_csr();
+  }
+
+  // Writes the finished arc lists out as the hierarchy's CSR.
+  //
+  // This cannot happen while the levels run: the rows have to come out in rank
+  // order and a level is not a range of ranks. Counting the rows first makes
+  // the write itself parallel again, so the only sequential part left is the
+  // prefix over the counts.
+  void write_csr() {
+    auto const n = c_.n_ranks();
+
+    auto pt = utl::get_active_progress_tracker_or_activate("osr");
+    pt->status("CCH Layout").reset_bounds().out_bounds(90.0F, 97.0F).in_high(2);
+
+    // The counts are already in place, `prepare` filled them in. The four
+    // prefixes do not depend on each other, so they run as four jobs.
+    pool_.run(4U, [&](std::size_t const which) {
+      switch (which) {
+        case 0U:
+          for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+            c_.adj_ofs_[cch_rank_t{i} + 1U] += c_.adj_ofs_[cch_rank_t{i}];
+          }
+          break;
+        case 1U:
+          for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
+            c_.loop_ofs_[cch_rank_t{i} + 1U] += c_.loop_ofs_[cch_rank_t{i}];
+          }
+          break;
+        case 2U:
+          for (auto i = std::size_t{0U}; i != n; ++i) {
+            up_base_[i + 1U] += up_base_[i];
+          }
+          break;
+        default:
+          for (auto i = std::size_t{0U}; i != n; ++i) {
+            dn_base_[i + 1U] += dn_base_[i];
+          }
+          break;
+      }
+    });
+    pt->update_monotonic(1U);
+
+    auto const n_slots = c_.adj_ofs_[cch_rank_t{n}];
+    c_.adj_head_.resize(n_slots);
+    c_.up_ofs_.resize(n_slots + 1U);
+    c_.dn_ofs_.resize(n_slots + 1U);
+    c_.up_.resize(up_base_[n]);
+    c_.dn_.resize(dn_base_[n]);
+    c_.loop_.resize(c_.loop_ofs_[cch_rank_t{n}]);
+    c_.up_ofs_[n_slots] = up_base_[n];
+    c_.dn_ofs_[n_slots] = dn_base_[n];
+
+    pool_.run(n, [&](std::size_t const i) {
+      auto const rank = cch_rank_t{static_cast<cch_rank_t::value_t>(i)};
+      auto& v = adj_[i];
+      auto slot = c_.adj_ofs_[rank];
+      auto up = up_base_[i];
+      auto dn = dn_base_[i];
       for (auto it = begin(v); it != end(v);) {
         auto const other = it->other_;
-        neighbors.emplace_back(other);
-        in_of.emplace_back();
-        out_of.emplace_back();
+        c_.adj_head_[slot] = cch_rank_t{other};
+        c_.up_ofs_[slot] = up;
+        c_.dn_ofs_[slot] = dn;
         for (; it != end(v) && it->other_ == other; ++it) {
-          (it->out_ != 0U ? out_of : in_of).back().push_back(
-              cch_entry{it->p_, it->q_});
+          auto const e = cch_entry{it->p_, it->q_};
+          if (it->out_ != 0U) {
+            c_.up_[up++] = e;
+          } else {
+            c_.dn_[dn++] = e;
+          }
         }
+        ++slot;
       }
       v.clear();
       v.shrink_to_fit();
-      clean_size_[i] = 0U;
 
-      // write the final CSR row of this node
-      for (auto k = std::size_t{0U}; k != neighbors.size(); ++k) {
-        c_.adj_head_.emplace_back(cch_rank_t{neighbors[k]});
-        for (auto const& e : out_of[k]) {
-          c_.up_.emplace_back(e);
-        }
-        for (auto const& e : in_of[k]) {
-          c_.dn_.emplace_back(e);
-        }
-        c_.up_ofs_.emplace_back(static_cast<cch_entry_idx_t>(c_.up_.size()));
-        c_.dn_ofs_.emplace_back(static_cast<cch_entry_idx_t>(c_.dn_.size()));
-      }
-
-      // contract: connect all pairs of remaining neighbors. `a == b` creates
-      // a self loop, i.e. the shortcut of turning around at this node.
-      //
-      // Every arc is pushed to the lower ranked of its two ends, so the pairs
-      // are enumerated per *target* instead of as a full matrix: the neighbor
-      // `k` collects the pairs whose lower end it is. Each target is then
-      // touched by exactly one task, which is what makes this parallel
-      // without any locking -- `adj_`, `loops_` and `clean_size_` are all
-      // indexed by the target.
-      auto const process_target = [&](std::size_t const k) {
-        auto const t = neighbors[k];
-
-        // pairs (k, b): this node is the tail, so it owns them if t < y
-        if (!in_of[k].empty()) {
-          for (auto b = std::size_t{0U}; b != neighbors.size(); ++b) {
-            if (out_of[b].empty()) {
-              continue;
-            }
-            auto const y = neighbors[b];
-            if (b != k && t >= y) {
-              continue;  // owned by `b`
-            }
-            for (auto const& e1 : in_of[k]) {
-              for (auto const& e2 : out_of[b]) {
-                if (!turn_reachable(node, e1.exit_, e2.entry_)) {
-                  continue;
-                }
-                if (b == k) {
-                  push_loop(t, cch_entry{e1.entry_, e2.exit_});
-                } else {
-                  push(t, arc_rec{y, 1U, e1.entry_, e2.exit_});
-                }
-              }
-            }
-          }
-        }
-
-        // pairs (a, k): this node is the head, so it owns them if t < x
-        if (!out_of[k].empty()) {
-          for (auto a = std::size_t{0U}; a != neighbors.size(); ++a) {
-            if (a == k || in_of[a].empty()) {
-              continue;
-            }
-            auto const x = neighbors[a];
-            if (x <= t) {
-              continue;  // owned by `a`
-            }
-            for (auto const& e1 : in_of[a]) {
-              for (auto const& e2 : out_of[k]) {
-                if (!turn_reachable(node, e1.exit_, e2.entry_)) {
-                  continue;
-                }
-                push(t, arc_rec{x, 0U, e1.entry_, e2.exit_});
-              }
-            }
-          }
-        }
-      };
-
-      // The work of a node grows with the square of its degree, so only the
-      // dense nodes are worth spreading over threads -- and those are exactly
-      // the ones that dominate the contraction.
-      if (n_threads_ > 1U && neighbors.size() >= kMinParallelDegree) {
-        pool_.run(neighbors.size(), process_target);
-      } else {
-        for (auto k = std::size_t{0U}; k != neighbors.size(); ++k) {
-          process_target(k);
-        }
-      }
-
-      pt->update_monotonic(i);
-    }
-
-    c_.adj_ofs_[cch_rank_t{n}] =
-        static_cast<cch_slot_idx_t>(c_.adj_head_.size());
-    c_.loop_ofs_[cch_rank_t{n}] =
-        static_cast<cch_entry_idx_t>(c_.loop_.size());
+      auto& lp = loops_[i];
+      std::copy(begin(lp), end(lp), begin(c_.loop_) + static_cast<std::ptrdiff_t>(
+                                        c_.loop_ofs_[rank]));
+      lp.clear();
+      lp.shrink_to_fit();
+    });
+    pt->update_monotonic(2U);
   }
 
   void build_transpose() {
@@ -521,7 +863,14 @@ struct contractor {
   std::vector<std::vector<arc_rec>> adj_;
   std::vector<std::vector<cch_entry>> loops_;
   std::vector<std::size_t> clean_size_;
-  std::array<std::uint32_t, kMaxPorts> reach_{};
+  std::array<std::mutex, kLockStripes> target_locks_;
+
+  // row sizes of the CSR, filled by `prepare` and prefixed by `write_csr`
+  std::vector<cch_entry_idx_t> up_base_, dn_base_;
+
+  // narrow levels: one scratch per node of the level, one job per neighbor
+  std::vector<node_scratch> level_scratch_;
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> slot_jobs_;
 };
 
 }  // namespace
@@ -540,19 +889,73 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
   // ---------------------------------------------------------------------
   pt->status("CCH Sub Graph").reset_bounds().out_bounds(0.0F, 1.0F).in_high(
       n_nodes);
+
+  // Chunk size of the node parallel passes. Large enough that the per chunk
+  // bookkeeping disappears, small enough that the last chunk cannot hold up
+  // the whole pass.
+  static constexpr auto const kChunk = std::uint32_t{1U << 16U};
+  auto const n_chunks_of = [](std::uint32_t const count) {
+    return static_cast<std::size_t>((count + kChunk - 1U) / kChunk);
+  };
+
+  auto constexpr kNoLocal = std::numeric_limits<std::uint32_t>::max();
   auto local = vec_map<node_idx_t, std::uint32_t>{};
-  local.resize(n_nodes, std::numeric_limits<std::uint32_t>::max());
+  local.resize(n_nodes, kNoLocal);
   auto nodes = std::vector<node_idx_t>{};
-  for (auto i = node_idx_t{0U}; i != node_idx_t{n_nodes}; ++i) {
-    auto const ways_of_node = r.node_ways_[i];
-    auto const relevant = utl::any_of(ways_of_node, [&](way_idx_t const way) {
-      return is_cch_way(r.way_properties_[way]);
-    });
-    if (relevant) {
-      local[i] = static_cast<std::uint32_t>(nodes.size());
-      nodes.emplace_back(i);
+  {
+    // Whether a node belongs to the sub graph is a read only test, so it runs
+    // over chunks in parallel. Only the numbering is sequential, and a second
+    // pass over the flags produces it without any synchronization: the first
+    // pass counts per chunk, the prefix over those counts gives every chunk
+    // the index its first node gets.
+    auto const n_chunks = n_chunks_of(n_nodes);
+    auto ofs = std::vector<std::uint32_t>(n_chunks + 1U, 0U);
+    auto const chunk_end = [&](std::size_t const ch) {
+      return std::min(n_nodes,
+                      static_cast<node_idx_t::value_t>((ch + 1U) * kChunk));
+    };
+
+    utl::parallel_for_run(
+        n_chunks,
+        [&](std::size_t const ch) {
+          auto cnt = std::uint32_t{0U};
+          for (auto i = static_cast<node_idx_t::value_t>(ch * kChunk);
+               i != chunk_end(ch); ++i) {
+            auto const n = node_idx_t{i};
+            if (utl::any_of(r.node_ways_[n], [&](way_idx_t const way) {
+                  return is_cch_way(r.way_properties_[way]);
+                })) {
+              local[n] = 0U;  // marked, numbered by the second pass
+              ++cnt;
+            }
+          }
+          ofs[ch + 1U] = cnt;
+        },
+        utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+        n_threads);
+
+    for (auto ch = std::size_t{0U}; ch != n_chunks; ++ch) {
+      ofs[ch + 1U] += ofs[ch];
     }
-    pt->update_monotonic(to_idx(i));
+    nodes.resize(ofs[n_chunks]);
+
+    utl::parallel_for_run(
+        n_chunks,
+        [&](std::size_t const ch) {
+          auto idx = ofs[ch];
+          for (auto i = static_cast<node_idx_t::value_t>(ch * kChunk);
+               i != chunk_end(ch); ++i) {
+            auto const n = node_idx_t{i};
+            if (local[n] != kNoLocal) {
+              local[n] = idx;
+              nodes[idx] = n;
+              ++idx;
+            }
+          }
+        },
+        utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+        n_threads);
+    pt->update_monotonic(n_nodes);
   }
 
   utl::verify(!nodes.empty(), "cch: empty sub graph");
@@ -568,32 +971,69 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
     g.ofs_.resize(n + 1U, 0U);
     g.x_.resize(n);
     g.y_.resize(n);
-    auto adj = std::vector<std::uint32_t>{};
-    for (auto u = std::uint32_t{0U}; u != n; ++u) {
-      auto const node = nodes[u];
-      g.x_[u] = w.get_node_pos(node).lat_;
-      g.y_[u] = w.get_node_pos(node).lng_;
-      auto const before = adj.size();
-      for_each_edge(r, node,
-                    [&](node_idx_t const v, way_idx_t const way, port_t,
-                        port_t, distance_t, std::uint16_t, std::uint16_t) {
-                      if (!is_cch_way(r.way_properties_[way])) {
-                        return;
-                      }
-                      auto const l = local[v];
-                      if (l != std::numeric_limits<std::uint32_t>::max() &&
-                          l != u) {
-                        adj.emplace_back(l);
-                      }
-                    });
-      std::sort(begin(adj) + static_cast<std::ptrdiff_t>(before), end(adj));
-      adj.erase(std::unique(begin(adj) + static_cast<std::ptrdiff_t>(before),
+
+    // Same shape as the sub graph pass, except that the rows are built once
+    // into a buffer per chunk and only copied into place afterwards -- the
+    // adjacency of a node is not known before it has been deduplicated, so
+    // counting first would mean building every row twice.
+    auto const n_chunks = n_chunks_of(n);
+    auto const chunk_end = [&](std::size_t const ch) {
+      return std::min(n, static_cast<std::uint32_t>((ch + 1U) * kChunk));
+    };
+    auto bufs = std::vector<std::vector<std::uint32_t>>(n_chunks);
+
+    utl::parallel_for_run(
+        n_chunks,
+        [&](std::size_t const ch) {
+          auto& adj = bufs[ch];
+          for (auto u = static_cast<std::uint32_t>(ch * kChunk);
+               u != chunk_end(ch); ++u) {
+            auto const node = nodes[u];
+            g.x_[u] = w.get_node_pos(node).lat_;
+            g.y_[u] = w.get_node_pos(node).lng_;
+            auto const before = adj.size();
+            for_each_edge(r, node,
+                          [&](node_idx_t const v, way_idx_t const way, port_t,
+                              port_t, distance_t, std::uint16_t,
+                              std::uint16_t) {
+                            if (!is_cch_way(r.way_properties_[way])) {
+                              return;
+                            }
+                            auto const l = local[v];
+                            if (l != kNoLocal && l != u) {
+                              adj.emplace_back(l);
+                            }
+                          });
+            std::sort(begin(adj) + static_cast<std::ptrdiff_t>(before),
+                      end(adj));
+            adj.erase(
+                std::unique(begin(adj) + static_cast<std::ptrdiff_t>(before),
                             end(adj)),
                 end(adj));
-      g.ofs_[u + 1U] = adj.size();
-      pt->update_monotonic(u);
+            g.ofs_[u + 1U] = adj.size() - before;  // degree, summed below
+          }
+        },
+        utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+        n_threads);
+
+    for (auto u = std::uint32_t{0U}; u != n; ++u) {
+      g.ofs_[u + 1U] += g.ofs_[u];
     }
-    g.adj_ = std::move(adj);
+    g.adj_.resize(g.ofs_[n]);
+
+    utl::parallel_for_run(
+        n_chunks,
+        [&](std::size_t const ch) {
+          auto& adj = bufs[ch];
+          std::copy(begin(adj), end(adj),
+                    begin(g.adj_) + static_cast<std::ptrdiff_t>(
+                                        g.ofs_[ch * kChunk]));
+          adj.clear();
+          adj.shrink_to_fit();
+        },
+        utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+        n_threads);
+    pt->update_monotonic(n);
   }
 
   auto const order = compute_inertial_flow_cutter_order(g, n_threads);
@@ -612,41 +1052,77 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
   }
 
   // ---------------------------------------------------------------------
-  // 4. contraction
+  // 4. elimination tree levels
+  // ---------------------------------------------------------------------
+  auto const levels = compute_levels(g, order);
+  g = nd_graph{};  // not needed any more, and it is not small
+
+  // ---------------------------------------------------------------------
+  // 5. contraction
   // ---------------------------------------------------------------------
   auto ctr = contractor{w, *c, n_threads};
   ctr.adj_.resize(n_ranks);
   ctr.loops_.resize(n_ranks);
   ctr.clean_size_.resize(n_ranks, 0U);
+  ctr.up_base_.resize(n_ranks + 1U, 0U);
+  ctr.dn_base_.resize(n_ranks + 1U, 0U);
+  c->adj_ofs_.resize(n_ranks + 1U, cch_slot_idx_t{0U});
+  c->loop_ofs_.resize(n_ranks + 1U, cch_entry_idx_t{0U});
 
   pt->status("CCH Seed").reset_bounds().out_bounds(6.0F, 8.0F).in_high(n_ranks);
-  for (auto i = cch_rank_t::value_t{0U}; i != n_ranks; ++i) {
-    auto const node = c->order_[cch_rank_t{i}];
-    for_each_edge(r, node,
-                  [&](node_idx_t const v, way_idx_t const way,
-                      port_t const tail_port, port_t const head_port,
-                      distance_t, std::uint16_t, std::uint16_t) {
-                    if (!is_cch_way(r.way_properties_[way]) ||
-                        !c->contains(v)) {
-                      return;
-                    }
-                    // a closed way can lead from a node back to itself: that
-                    // is an original self loop
-                    if (v == node) {
-                      ctr.push_loop(i, cch_entry{tail_port, head_port});
-                      return;
-                    }
-                    auto const other = to_idx(c->rank_[v]);
-                    if (i < other) {
-                      ctr.push(i, arc_rec{other, 1U, tail_port, head_port});
-                    } else {
-                      ctr.push(other, arc_rec{i, 0U, tail_port, head_port});
-                    }
-                  });
-    pt->update_monotonic(i);
-  }
 
-  ctr.contract();
+  // Runs over the ranks in parallel. `push` and `push_loop` are only safe
+  // without a lock as long as every target list is written by one thread, so
+  // a rank seeds exactly the records that belong to *itself*: the edge to a
+  // higher ranked neighbour, and its reverse, which the neighbour would
+  // otherwise have contributed.
+  //
+  // `for_each_edge` reports the two directions of an original edge from their
+  // respective tail, so the reverse of `node --way--> v` is the edge that `v`
+  // reports for the same pair of way positions, travelled the other way round.
+  // Its ports are therefore the ports of this edge with the direction bit
+  // flipped -- for `v` that is the same way slot, for `node` the way slot has
+  // to be looked up, because a node can sit on the same way more than once.
+  utl::parallel_for_run(
+      n_ranks,
+      [&](std::size_t const rank) {
+        auto const i = static_cast<cch_rank_t::value_t>(rank);
+        auto const node = c->order_[cch_rank_t{i}];
+        for_each_edge(
+            r, node,
+            [&](node_idx_t const v, way_idx_t const way,
+                port_t const tail_port, port_t const head_port, distance_t,
+                std::uint16_t const from, std::uint16_t) {
+              if (!is_cch_way(r.way_properties_[way]) || !c->contains(v)) {
+                return;
+              }
+              // a closed way can lead from a node back to itself: that is an
+              // original self loop, and both of its directions are reported
+              // here anyway
+              if (v == node) {
+                ctr.push_loop(i, cch_entry{tail_port, head_port});
+                return;
+              }
+              auto const other = to_idx(c->rank_[v]);
+              if (i >= other) {
+                return;  // both records belong to `other`
+              }
+              ctr.push(i, arc_rec{other, 1U, tail_port, head_port});
+
+              auto const rev_dir = port_dir(tail_port) == direction::kForward
+                                       ? direction::kBackward
+                                       : direction::kForward;
+              ctr.push(i, arc_rec{other, 0U,
+                                  static_cast<port_t>(head_port ^ 1U),
+                                  make_port(r.get_way_pos(node, way, from),
+                                            rev_dir)});
+            });
+      },
+      utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+      n_threads);
+  pt->update_monotonic(n_ranks);
+
+  ctr.contract(levels);
   ctr.build_transpose();
 
   // remember which entries an original edge maps to
@@ -657,45 +1133,52 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
       .reset_bounds()
       .out_bounds(97.0F, 100.0F)
       .in_high(n_ranks);
-  for (auto i = cch_rank_t::value_t{0U}; i != n_ranks; ++i) {
-    auto const rank = cch_rank_t{i};
-    auto const node = c->order_[rank];
-    for_each_edge(
-        r, node,
-        [&](node_idx_t const v, way_idx_t const way, port_t const tail_port,
-            port_t const head_port, distance_t, std::uint16_t,
-            std::uint16_t) {
-          if (!is_cch_way(r.way_properties_[way]) || !c->contains(v)) {
-            return;
-          }
-          auto const e = cch_entry{tail_port, head_port};
-          if (v == node) {
-            auto const idx = cch::find_entry(c->loop_entries(rank), e);
-            if (idx != std::numeric_limits<cch_entry_idx_t>::max()) {
-              c->loop_is_edge_.set(c->loop_begin(rank) + idx);
-            }
-            return;
-          }
-          auto const other = c->rank_[v];
-          auto const up = rank < other;
-          auto const slot =
-              up ? c->find_slot(rank, other) : c->find_slot(other, rank);
-          if (slot == cch::kNoSlot) {
-            return;
-          }
-          auto const idx = cch::find_entry(
-              up ? c->up_entries(slot) : c->dn_entries(slot), e);
-          if (idx == std::numeric_limits<cch_entry_idx_t>::max()) {
-            return;
-          }
-          if (up) {
-            c->up_is_edge_.set(c->up_ofs_[slot] + idx);
-          } else {
-            c->dn_is_edge_.set(c->dn_ofs_[slot] + idx);
-          }
-        });
-    pt->update_monotonic(i);
-  }
+
+  // Runs over the ranks in parallel. Two ranks never set the same bit, but
+  // the bits of neighbouring ranks share a block, so the writes are atomic.
+  utl::parallel_for_run(
+      n_ranks,
+      [&](std::size_t const i) {
+        auto const rank = cch_rank_t{static_cast<cch_rank_t::value_t>(i)};
+        auto const node = c->order_[rank];
+        for_each_edge(
+            r, node,
+            [&](node_idx_t const v, way_idx_t const way, port_t const tail_port,
+                port_t const head_port, distance_t, std::uint16_t,
+                std::uint16_t) {
+              if (!is_cch_way(r.way_properties_[way]) || !c->contains(v)) {
+                return;
+              }
+              auto const e = cch_entry{tail_port, head_port};
+              if (v == node) {
+                auto const idx = cch::find_entry(c->loop_entries(rank), e);
+                if (idx != std::numeric_limits<cch_entry_idx_t>::max()) {
+                  c->loop_is_edge_.set<true>(c->loop_begin(rank) + idx);
+                }
+                return;
+              }
+              auto const other = c->rank_[v];
+              auto const up = rank < other;
+              auto const slot =
+                  up ? c->find_slot(rank, other) : c->find_slot(other, rank);
+              if (slot == cch::kNoSlot) {
+                return;
+              }
+              auto const idx = cch::find_entry(
+                  up ? c->up_entries(slot) : c->dn_entries(slot), e);
+              if (idx == std::numeric_limits<cch_entry_idx_t>::max()) {
+                return;
+              }
+              if (up) {
+                c->up_is_edge_.set<true>(c->up_ofs_[slot] + idx);
+              } else {
+                c->dn_is_edge_.set<true>(c->dn_ofs_[slot] + idx);
+              }
+            });
+      },
+      utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
+      n_threads);
+  pt->update_monotonic(n_ranks);
 
   return c;
 }
