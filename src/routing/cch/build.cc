@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <span>
@@ -121,6 +122,21 @@ struct node_scratch {
     return {out_grp_.data() + out_ofs_[k], out_ofs_[k + 1U] - out_ofs_[k]};
   }
 };
+
+// The finished row of one node, in the layout `write_csr` wants it: a header
+// per slot, then that node's up entries and dn entries, both grouped by slot.
+//
+// Contracting by level means a node's arcs have to outlive the node, because
+// the CSR comes out in rank order and a level is not a range of ranks. Keeping
+// the raw `arc_rec`s for that costs eight bytes a record plus a vector header a
+// node -- 54 GB on the planet, which is more memory than is left once the order
+// has run. The same content re-encoded is two bytes an entry in one allocation.
+struct slot_head {
+  cch_rank_t::value_t head_;
+  std::uint16_t n_up_, n_dn_;
+};
+
+static_assert(sizeof(slot_head) == 8U);
 
 // Stripe lock over the target lists. A target is written by one node at a
 // time, but two nodes of the same level can share one, so `process_target`
@@ -554,6 +570,30 @@ struct contractor {
     up_base_[i + 1U] = n_up;
     dn_base_[i + 1U] = n_dn;
 
+    // The arc records are dead from here on -- everything the contraction still
+    // needs sits in the scratch, and everything the layout needs is the row.
+    // Writing it now is what keeps the retained set to the row rather than to
+    // the records it was built from.
+    auto const bytes = k * sizeof(slot_head) +
+                       static_cast<std::size_t>(n_up + n_dn) * sizeof(cch_entry);
+    auto buf = std::make_unique_for_overwrite<std::byte[]>(bytes);
+    auto* const heads = reinterpret_cast<slot_head*>(buf.get());
+    auto* up = reinterpret_cast<cch_entry*>(buf.get() + k * sizeof(slot_head));
+    auto* dn = up + n_up;
+    for (auto j = std::size_t{0U}; j != k; ++j) {
+      auto const& out = s.out_of_[j];
+      auto const& in = s.in_of_[j];
+      heads[j] = slot_head{s.neighbors_[j],
+                           static_cast<std::uint16_t>(out.size()),
+                           static_cast<std::uint16_t>(in.size())};
+      up = std::copy(begin(out), end(out), up);
+      dn = std::copy(begin(in), end(in), dn);
+    }
+    row_[i] = std::move(buf);
+
+    v.clear();
+    v.shrink_to_fit();
+
     // group both entry lists of every neighbor by their far port
     s.in_grp_.clear();
     s.out_grp_.clear();
@@ -799,27 +839,29 @@ struct contractor {
 
     pool_.run(n, [&](std::size_t const i) {
       auto const rank = cch_rank_t{static_cast<cch_rank_t::value_t>(i)};
-      auto& v = adj_[i];
+      auto const n_nb = c_.adj_ofs_[rank + 1U] - c_.adj_ofs_[rank];
+      auto const* const heads =
+          reinterpret_cast<slot_head const*>(row_[i].get());
+      auto const* src_up = reinterpret_cast<cch_entry const*>(
+          row_[i].get() + n_nb * sizeof(slot_head));
+      auto const* src_dn = src_up + (up_base_[i + 1U] - up_base_[i]);
+
       auto slot = c_.adj_ofs_[rank];
       auto up = up_base_[i];
       auto dn = dn_base_[i];
-      for (auto it = begin(v); it != end(v);) {
-        auto const other = it->other_;
-        c_.adj_head_[slot] = cch_rank_t{other};
+      for (auto j = cch_slot_idx_t{0U}; j != n_nb; ++j) {
+        c_.adj_head_[slot] = cch_rank_t{heads[j].head_};
         c_.up_ofs_[slot] = up;
         c_.dn_ofs_[slot] = dn;
-        for (; it != end(v) && it->other_ == other; ++it) {
-          auto const e = cch_entry{it->p_, it->q_};
-          if (it->out_ != 0U) {
-            c_.up_[up++] = e;
-          } else {
-            c_.dn_[dn++] = e;
-          }
-        }
+        std::copy(src_up, src_up + heads[j].n_up_, c_.up_.data() + up);
+        std::copy(src_dn, src_dn + heads[j].n_dn_, c_.dn_.data() + dn);
+        src_up += heads[j].n_up_;
+        src_dn += heads[j].n_dn_;
+        up += heads[j].n_up_;
+        dn += heads[j].n_dn_;
         ++slot;
       }
-      v.clear();
-      v.shrink_to_fit();
+      row_[i].reset();
 
       auto& lp = loops_[i];
       std::copy(begin(lp), end(lp), begin(c_.loop_) + static_cast<std::ptrdiff_t>(
@@ -867,6 +909,8 @@ struct contractor {
 
   // row sizes of the CSR, filled by `prepare` and prefixed by `write_csr`
   std::vector<cch_entry_idx_t> up_base_, dn_base_;
+  // the finished rows, one packed buffer per rank
+  std::vector<std::unique_ptr<std::byte[]>> row_;
 
   // narrow levels: one scratch per node of the level, one job per neighbor
   std::vector<node_scratch> level_scratch_;
@@ -1066,6 +1110,7 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
   ctr.clean_size_.resize(n_ranks, 0U);
   ctr.up_base_.resize(n_ranks + 1U, 0U);
   ctr.dn_base_.resize(n_ranks + 1U, 0U);
+  ctr.row_.resize(n_ranks);
   c->adj_ofs_.resize(n_ranks + 1U, cch_slot_idx_t{0U});
   c->loop_ofs_.resize(n_ranks + 1U, cch_entry_idx_t{0U});
 
