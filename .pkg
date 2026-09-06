@@ -27,9 +27,9 @@
   branch=master
   commit=9758d168fd1ccff2d76f3bd6ef802943d0f8f7e5
 [inertialflowcutter]
-  url=git@github.com:motis-project/InertialFlowCutter.git
-  branch=master
-  commit=04bc916d16df4dca862f92a1e441252e5775b3e4
+  url=git@github.com:mority/InertialFlowCutter.git
+  branch=pe-cch
+  commit=cc99f5fe1afd70950549f6a357ac6c459c6de15a
 [mimalloc]
   url=git@github.com:motis-project/mimalloc.git
   branch=master
