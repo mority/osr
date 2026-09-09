@@ -64,8 +64,7 @@ struct cch_search {
     cost_t cost_;
   };
 
-  static constexpr auto const kNoLoop =
-      std::numeric_limits<cch_entry_idx_t>::max();
+  static constexpr auto const kNoLoop = kNoEntry;
 
   // Cost of the last mile per arriving port of a target node. Ports that can
   // only reach the last mile by driving a self loop first (turn around) get
@@ -120,13 +119,10 @@ struct cch_search {
   // check itself costs more than that, so it is off by default.
   static constexpr auto const kStallOnDemand = false;
 
-  bool run(typename P::parameters const& params,
-           ways const& w,
-           cch const& c,
-           cch_metric const& m,
-           cost_t const max) {
-    auto const& r = *w.r_;
-
+  // Common setup of the three entry points. The bucket counts stay with the
+  // caller: a one directional run only fills one of the two queues, and sizing
+  // the other one is not free.
+  void reset(cost_t const max) {
     max_ = max;
     best_ = kInfeasible;
     meet_rank_ = cch_rank_t::invalid();
@@ -136,20 +132,30 @@ struct cch_search {
     b_.clear();
     target_at_.clear();
     pq_f_.clear();
-    pq_f_.n_buckets(max);
     pq_b_.clear();
-    pq_b_.n_buckets(max);
+  }
 
-    auto const turn = [&](node_idx_t const n, port_t const in,
-                          port_t const out) {
-      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
-    };
-
+  void seed_starts(map_t& map, dial<label, get_bucket>& pq) {
     for (auto const& s : starts_) {
-      if (s.cost_ < max) {
-        relax(f_, pq_f_, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
+      if (s.cost_ < max_) {
+        relax(map, pq, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
       }
     }
+  }
+
+  bool run(typename P::parameters const& params,
+           ways const& w,
+           cch const& c,
+           cch_metric const& m,
+           cost_t const max) {
+    auto const& r = *w.r_;
+
+    reset(max);
+    pq_f_.n_buckets(max);
+    pq_b_.n_buckets(max);
+
+    auto const turn = cch_turn_fn<P>(params, w);
+    seed_starts(f_, pq_f_);
 
     // The target states are "arrived at the target node", the last mile does
     // not add a turn. Therefore they are expanded directly instead of being
@@ -202,33 +208,14 @@ struct cch_search {
                    cch const& c,
                    cch_metric const& m,
                    cost_t const max) {
-    auto const& r = *w.r_;
-
-    max_ = max;
-    best_ = kInfeasible;
-    meet_rank_ = cch_rank_t::invalid();
-    max_reached_ = false;
-    n_settled_ = 0U;
-    f_.clear();
-    b_.clear();
-    target_at_.clear();
-    pq_f_.clear();
+    reset(max);
     pq_f_.n_buckets(max);
-    pq_b_.clear();
 
-    auto const turn = [&](node_idx_t const n, port_t const in,
-                          port_t const out) {
-      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
-    };
-
-    for (auto const& s : starts_) {
-      if (s.cost_ < max) {
-        relax(f_, pq_f_, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
-      }
-    }
+    auto const turn = cch_turn_fn<P>(params, w);
+    seed_starts(f_, pq_f_);
 
     while (!pq_f_.empty()) {
-      step<true>(r, c, m, turn);
+      step<true>(*w.r_, c, m, turn);
     }
 
     return !max_reached_;
@@ -243,33 +230,14 @@ struct cch_search {
                     cch const& c,
                     cch_metric const& m,
                     cost_t const max) {
-    auto const& r = *w.r_;
-
-    max_ = max;
-    best_ = kInfeasible;
-    meet_rank_ = cch_rank_t::invalid();
-    max_reached_ = false;
-    n_settled_ = 0U;
-    f_.clear();
-    b_.clear();
-    target_at_.clear();
-    pq_f_.clear();
-    pq_b_.clear();
+    reset(max);
     pq_b_.n_buckets(max);
 
-    auto const turn = [&](node_idx_t const n, port_t const in,
-                          port_t const out) {
-      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
-    };
-
-    for (auto const& s : starts_) {
-      if (s.cost_ < max) {
-        relax(b_, pq_b_, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
-      }
-    }
+    auto const turn = cch_turn_fn<P>(params, w);
+    seed_starts(b_, pq_b_);
 
     while (!pq_b_.empty()) {
-      step<false>(r, c, m, turn);
+      step<false>(*w.r_, c, m, turn);
     }
 
     return !max_reached_;
@@ -326,49 +294,37 @@ struct cch_search {
       return;
     }
     auto const n = c.order_[rank];
-    auto const ports = std::min(n_ports(r, n), kMaxPorts);
+    auto const ports = n_capped_ports(r, n);
 
-    auto done = std::uint32_t{0U};
-    for (auto step = port_t{0U}; step != ports; ++step) {
-      auto best = kInfeasible;
-      auto at = kMaxPorts;
-      for (auto p = port_t{0U}; p != ports; ++p) {
-        if ((done & (std::uint32_t{1U} << p)) == 0U && ts.cost_[p] < best) {
-          best = ts.cost_[p];
-          at = p;
-        }
-      }
-      if (at == kMaxPorts) {
-        break;
-      }
-      done |= std::uint32_t{1U} << at;
-
-      // which port `p` can reach `at` by driving one loop?
-      for (auto k = std::size_t{0U}; k != loops.size(); ++k) {
-        if (loops[k].exit_ != at) {
-          continue;
-        }
-        auto const idx = static_cast<cch_entry_idx_t>(c.loop_begin(rank) + k);
-        auto const weight = m.loop(idx);
-        if (weight == kInfeasible) {
-          continue;
-        }
-        for (auto p = port_t{0U}; p != ports; ++p) {
-          auto const tc = cch_turn_cost<P>(params, r, timezones, n, p,
-                                           loops[k].entry_);
-          if (tc == kInfeasible) {
-            continue;
+    for_ports_by_cost(
+        ports, [&](port_t const p) { return ts.cost_[p]; },
+        [&](port_t const at, cost_t const best) {
+          // which port `p` can reach `at` by driving one loop?
+          for (auto k = std::size_t{0U}; k != loops.size(); ++k) {
+            if (loops[k].exit_ != at) {
+              continue;
+            }
+            auto const idx = c.loop_begin(rank) + k;
+            auto const weight = m.loop(idx);
+            if (weight == kInfeasible) {
+              continue;
+            }
+            for (auto p = port_t{0U}; p != ports; ++p) {
+              auto const tc = cch_turn_cost<P>(params, r, timezones, n, p,
+                                               loops[k].entry_);
+              if (tc == kInfeasible) {
+                continue;
+              }
+              auto const cost =
+                  clamp_cost(static_cast<std::uint64_t>(best) + tc + weight);
+              if (cost < ts.cost_[p]) {
+                ts.cost_[p] = cost;
+                ts.loop_[p] = idx;
+                ts.next_[p] = at;
+              }
+            }
           }
-          auto const cost =
-              clamp_cost(static_cast<std::uint64_t>(best) + tc + weight);
-          if (cost < ts.cost_[p]) {
-            ts.cost_[p] = cost;
-            ts.loop_[p] = idx;
-            ts.next_[p] = at;
-          }
-        }
-      }
-    }
+        });
   }
 
   // Relaxes all arcs that arrive at `rank` with port `p` without charging a
@@ -414,8 +370,7 @@ struct cch_search {
       // forward: arcs h -> this node, backward: arcs this node -> h
       auto const entries = Forward ? c.dn_entries(s) : c.up_entries(s);
       auto const ofs = Forward ? c.dn_ofs_[s] : c.up_ofs_[s];
-      auto const h_ports =
-          std::min(n_ports(r, c.order_[h]), kMaxPorts);
+      auto const h_ports = n_capped_ports(r, c.order_[h]);
       for (auto k = std::size_t{0U}; k != entries.size(); ++k) {
         if ((Forward ? entries[k].exit_ : entries[k].entry_) != l.port_) {
           continue;
@@ -470,7 +425,7 @@ struct cch_search {
 
     // meeting with the opposite search
     if (auto const it = other.find(to_idx(l.rank_)); it != end(other)) {
-      auto const ports = std::min(n_ports(r, n), kMaxPorts);
+      auto const ports = n_capped_ports(r, n);
       for (auto p = port_t{0U}; p != ports; ++p) {
         auto const c2 = it->second.cost_[p];
         if (c2 == kInfeasible) {

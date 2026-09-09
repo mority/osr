@@ -28,7 +28,7 @@ struct cch_unpacker {
 
   void unpack_loop(cch_entry_idx_t const idx,
                    std::vector<cch_path_edge>& out) {
-    auto const rank = loop_owner(idx);
+    auto const rank = c_.loop_owner(idx);
     utl::verify(rank != cch_rank_t::invalid(), "cch: unknown self loop {}",
                 idx);
     expand(rank, rank, c_.loop_[idx], m_.loop(idx),
@@ -50,24 +50,6 @@ struct cch_unpacker {
   }
 
 private:
-  // binary search for the node a self loop belongs to
-  cch_rank_t loop_owner(cch_entry_idx_t const idx) const {
-    auto lo = cch_rank_t::value_t{0U};
-    auto hi = c_.n_ranks();
-    while (lo + 1U < hi) {
-      auto const mid = lo + (hi - lo) / 2U;
-      if (c_.loop_ofs_[cch_rank_t{mid}] <= idx) {
-        lo = mid;
-      } else {
-        hi = mid;
-      }
-    }
-    return c_.loop_ofs_[cch_rank_t{lo}] <= idx &&
-                   idx < c_.loop_ofs_[cch_rank_t{lo + 1U}]
-               ? cch_rank_t{lo}
-               : cch_rank_t::invalid();
-  }
-
   void expand(cch_rank_t const x,
               cch_rank_t const y,
               cch_entry const e,
@@ -156,8 +138,9 @@ private:
             continue;
           }
           if (!turns_ready) {
-            turns_.reset(params_, w_, c_,
-                       [&](cch_entry_idx_t const i) { return m_.loop(i); }, via);
+            turns_.reset(
+                params_, w_, c_,
+                [&](cch_entry_idx_t const i) { return m_.loop(i); }, via);
             turns_ready = true;
           }
           loops.clear();

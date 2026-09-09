@@ -53,4 +53,14 @@ cost_t cch_turn_cost(typename P::parameters const& params,
       params, r.get_turn_angle(n, from, port_dir(in), to, port_dir(out)));
 }
 
+// Binds the profile context, which stays the same for a whole search, so that
+// the searches can pass a turn cost around as a plain `(node, in, out)`
+// function.
+template <WayAwareProfile P>
+auto cch_turn_fn(typename P::parameters const& params, ways const& w) {
+  return [&](node_idx_t const n, port_t const in, port_t const out) {
+    return cch_turn_cost<P>(params, *w.r_, w.timezones_, n, in, out);
+  };
+}
+
 }  // namespace osr

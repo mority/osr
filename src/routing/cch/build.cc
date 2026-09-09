@@ -534,7 +534,7 @@ struct contractor {
 
     auto& lp = loops_[i];
     dedup(lp);
-    auto const ports = std::min(n_ports(r_, node), kMaxPorts);
+    auto const ports = n_capped_ports(r_, node);
     build_allowed(s, node, std::span<cch_entry const>{lp}, ports);
 
     // group the arc records by neighbor. The inner lists are reused instead
@@ -727,9 +727,7 @@ struct contractor {
   // Most of the work sits in the few, very dense levels at the top, and those
   // cannot be spread over their nodes. They are spread over the (node,
   // neighbor) pairs instead, which needs the whole level's grouping to be held
-  // at once -- hence the cutoff, the same one `customize()` uses.
-  static constexpr auto const kMaxNodeParallelLevel = std::size_t{1024U};
-
+  // at once -- hence `kLevelParallelCutoff`, which `customize()` shares.
   void contract(std::vector<std::vector<cch_rank_t::value_t>> const& by_level) {
     auto const n = c_.n_ranks();
 
@@ -749,7 +747,7 @@ struct contractor {
             process_target(s, k);
           }
         }
-      } else if (lvl.size() > kMaxNodeParallelLevel) {
+      } else if (lvl.size() > kLevelParallelCutoff) {
         // wide level: one job per node, every worker reusing its scratch
         pool_.run(lvl.size(), [&](std::size_t const i) {
           static thread_local auto s = node_scratch{};
@@ -1194,30 +1192,15 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
               if (!is_cch_way(r.way_properties_[way]) || !c->contains(v)) {
                 return;
               }
-              auto const e = cch_entry{tail_port, head_port};
-              if (v == node) {
-                auto const idx = cch::find_entry(c->loop_entries(rank), e);
-                if (idx != std::numeric_limits<cch_entry_idx_t>::max()) {
-                  c->loop_is_edge_.set<true>(c->loop_begin(rank) + idx);
-                }
-                return;
-              }
-              auto const other = c->rank_[v];
-              auto const up = rank < other;
-              auto const slot =
-                  up ? c->find_slot(rank, other) : c->find_slot(other, rank);
-              if (slot == cch::kNoSlot) {
-                return;
-              }
-              auto const idx = cch::find_entry(
-                  up ? c->up_entries(slot) : c->dn_entries(slot), e);
-              if (idx == std::numeric_limits<cch_entry_idx_t>::max()) {
-                return;
-              }
-              if (up) {
-                c->up_is_edge_.set<true>(c->up_ofs_[slot] + idx);
-              } else {
-                c->dn_is_edge_.set<true>(c->dn_ofs_[slot] + idx);
+              auto const ref =
+                  c->find_edge(rank, v, cch_entry{tail_port, head_port});
+              switch (ref.kind_) {
+                case cch_arc::kUp: c->up_is_edge_.set<true>(ref.idx_); break;
+                case cch_arc::kDn: c->dn_is_edge_.set<true>(ref.idx_); break;
+                case cch_arc::kLoop:
+                  c->loop_is_edge_.set<true>(ref.idx_);
+                  break;
+                case cch_arc::kNone: break;
               }
             });
       },

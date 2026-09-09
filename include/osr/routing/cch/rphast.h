@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/query.h"
+#include "osr/routing/cch/sweep.h"
 #include "osr/routing/cch/turns.h"
 #include "utl/verify.h"
 
@@ -65,6 +67,7 @@ struct rphast {
     cost_t weight_;
   };
 
+  // Same shape as a `cch_entry`, plus the weight the metric gave it.
   struct loop_arc {
     port_t entry_;
     port_t exit_;
@@ -98,7 +101,6 @@ struct rphast {
   bool no_starts() const { return search_.no_starts(); }
   std::size_t n_selected() const { return order_.size(); }
   std::size_t n_arcs() const { return arcs_.size(); }
-  bool materialized() const { return materialized_; }
   bool packed() const { return packed_; }
 
   // ---- phase 2a: target selection, metric independent ---------------------
@@ -175,7 +177,7 @@ struct rphast {
       pos_[to_idx(order_[i])] = static_cast<std::uint32_t>(i);
       auto const nd = c.order_[order_[i]];
       node_[i] = nd;
-      auto const p = std::min(n_ports(r, nd), kMaxPorts);
+      auto const p = n_capped_ports(r, nd);
       ports_[i] = p;
       ofs_.push_back(ofs_.back() + p);
       turn_ofs_.push_back(turn_ofs_.back() +
@@ -247,8 +249,7 @@ struct rphast {
         if (lk.exit_ >= head_ports || lk.entry_ >= head_ports) {
           continue;
         }
-        lps_.push_back(loop_arc{backward_ ? lk.exit_ : lk.entry_,
-                                backward_ ? lk.entry_ : lk.exit_, kInfeasible});
+        lps_.push_back(loop_arc{lk.entry_, lk.exit_, kInfeasible});
         lp_widx_.push_back(static_cast<cch_entry_idx_t>(c.loop_begin(rk) + k));
       }
       lp_ofs_.push_back(static_cast<std::uint32_t>(lps_.size()));
@@ -356,73 +357,33 @@ private:
                        cch const& c,
                        cch_metric const& m,
                        cost_t const max) {
-    auto const& r = *w.r_;
-    auto const turn = [&](node_idx_t const n, port_t const in,
-                          port_t const out) {
-      return cch_turn_cost<P>(params, r, w.timezones_, n, in, out);
+    auto const turn = cch_turn_fn<P>(params, w);
+    auto const at = [&](std::uint32_t const i) {
+      return cch_sweep_node{ofs_[i], ports_[i], node_[i]};
     };
 
-    for (auto i = std::size_t{0U}; i != order_.size(); ++i) {
+    for (auto i = std::uint32_t{0U}; i != order_.size(); ++i) {
       auto const rk = order_[i];
-      auto const base = ofs_[i];
-      auto const ports = ports_[i];
+      auto const here = at(i);
 
-      // Pull along the downward arcs that end here. Their tails rank higher
-      // and the sweep is descending, so every one of them is already final.
-      for (auto s = c.upper_begin(rk); s != c.upper_end(rk); ++s) {
-        auto const entries = backward_ ? c.up_entries(s) : c.dn_entries(s);
-        if (entries.empty()) {
-          continue;
-        }
-        auto const hidx = pos_[to_idx(c.adj_head_[s])];
-        if (hidx == kNone) {
-          continue;  // cannot happen: the closure put every tail in T'
-        }
-        auto const hbase = ofs_[hidx];
-        auto const hports = ports_[hidx];
-        auto const hn = node_[hidx];
-        auto const ofs = backward_ ? c.up_ofs_[s] : c.dn_ofs_[s];
-        for (auto k = std::size_t{0U}; k != entries.size(); ++k) {
-          auto const e = entries[k];
-          auto const tail_port = backward_ ? e.exit_ : e.entry_;
-          auto const head_port = backward_ ? e.entry_ : e.exit_;
-          if (head_port >= ports || tail_port >= hports) {
-            continue;
-          }
-          auto const weight = backward_ ? m.up(ofs + k) : m.dn(ofs + k);
-          if (weight == kInfeasible) {
-            continue;
-          }
-          auto& dst = cost_[base + head_port];
-          for (auto q = port_t{0U}; q != hports; ++q) {
-            auto const ch = cost_[hbase + q];
-            if (ch == kInfeasible) {
-              continue;
-            }
-            // Reversed, the turn at the tail is taken arriving on the arc and
-            // leaving by the port the state already holds.
-            auto const tc = backward_ ? turn(hn, tail_port, q)
-                                      : turn(hn, q, tail_port);
-            if (tc == kInfeasible) {
-              continue;
-            }
-            auto const nc =
-                clamp_cost(static_cast<std::uint64_t>(ch) + tc + weight);
-            if (nc < max && nc < dst) {
-              dst = nc;
-            }
-          }
-        }
-      }
+      // The tails of the downward arcs rank higher and the sweep is
+      // descending, so every one of them is already final.
+      cch_relax_dn_arcs(
+          c, m, rk, backward_, max, here, cost_,
+          [&](cch_rank_t const h) -> std::optional<cch_sweep_node> {
+            auto const idx = pos_[to_idx(h)];
+            // kNone cannot happen: the closure put every tail in T'
+            return idx == kNone ? std::nullopt : std::optional{at(idx)};
+          },
+          turn);
 
-      close_loops(base, ports, max, mirrored_loops(c, rk),
-                  [&](std::size_t const k) {
-                    return m.loop(
-                        static_cast<cch_entry_idx_t>(c.loop_begin(rk) + k));
-                  },
-                  [&](port_t const in, port_t const out) {
-                    return turn(node_[i], in, out);
-                  });
+      cch_close_loops(
+          std::span{cost_}.subspan(here.base_, here.ports_), here.ports_, max,
+          backward_, c.loop_entries(rk),
+          [&](std::size_t const k) { return m.loop(c.loop_begin(rk) + k); },
+          [&](port_t const in, port_t const out) {
+            return turn(here.node_, in, out);
+          });
     }
   }
 
@@ -465,71 +426,14 @@ private:
 
       auto const tbase = turn_ofs_[i];
       auto const ports = ports_[i];
-      close_loops(base, ports, max,
-                  std::span{lps_.data() + lp_ofs_[i],
-                            lp_ofs_[i + 1U] - lp_ofs_[i]},
-                  [&](std::size_t const k) {
-                    return lps_[lp_ofs_[i] + k].weight_;
-                  },
-                  [&](port_t const in, port_t const out) {
-                    return turn_[tbase + static_cast<std::uint32_t>(in) *
-                                             ports + out];
-                  });
-    }
-  }
-
-  // A self loop leaves the node on one port and returns on another, so it can
-  // improve a port after the downward arcs have been pulled. Settling the ports
-  // in increasing cost makes chains of loops converge in one pass, the same way
-  // `close_target_loops` does it on the target side of a point to point query.
-  // The entries, their weights and the turn costs come from the caller so that
-  // both sweeps share the logic.
-  template <typename Entries, typename WeightFn, typename TurnFn>
-  void close_loops(std::uint32_t const base,
-                   port_t const ports,
-                   cost_t const max,
-                   Entries const& loops,
-                   WeightFn const& weight_of,
-                   TurnFn const& turn) {
-    if (loops.empty()) {
-      return;
-    }
-
-    auto done = std::uint32_t{0U};
-    for (auto step = port_t{0U}; step != ports; ++step) {
-      auto best = kInfeasible;
-      auto at = kMaxPorts;
-      for (auto q = port_t{0U}; q != ports; ++q) {
-        if ((done & (std::uint32_t{1U} << q)) == 0U && cost_[base + q] < best) {
-          best = cost_[base + q];
-          at = q;
-        }
-      }
-      if (at == kMaxPorts) {
-        break;
-      }
-      done |= std::uint32_t{1U} << at;
-
-      for (auto k = std::size_t{0U}; k != loops.size(); ++k) {
-        auto const entry = loops[k].entry_;
-        auto const exit = loops[k].exit_;
-        if (entry >= ports || exit >= ports) {
-          continue;
-        }
-        auto const wgt = weight_of(k);
-        if (wgt == kInfeasible) {
-          continue;
-        }
-        auto const tc = backward_ ? turn(entry, at) : turn(at, entry);
-        if (tc == kInfeasible) {
-          continue;
-        }
-        auto const nc =
-            clamp_cost(static_cast<std::uint64_t>(best) + tc + wgt);
-        if (nc < max && nc < cost_[base + exit]) {
-          cost_[base + exit] = nc;
-        }
-      }
+      auto const loops = std::span{lps_.data() + lp_ofs_[i],
+                                   lp_ofs_[i + 1U] - lp_ofs_[i]};
+      cch_close_loops(
+          std::span{cost_}.subspan(base, ports), ports, max, backward_, loops,
+          [&](std::size_t const k) { return loops[k].weight_; },
+          [&](port_t const in, port_t const out) {
+            return turn_[tbase + static_cast<std::uint32_t>(in) * ports + out];
+          });
     }
   }
 
@@ -560,21 +464,6 @@ private:
   std::vector<std::uint32_t> turn_ofs_;
   std::vector<cost_t> turn_;
 
-  // Loop entries with the ports put in sweep role order, matching how the
-  // packed path stores them.
-  std::span<loop_arc const> mirrored_loops(cch const& c, cch_rank_t const rk) {
-    auto const loops = c.loop_entries(rk);
-    scratch_loops_.clear();
-    scratch_loops_.reserve(loops.size());
-    for (auto const& lk : loops) {
-      scratch_loops_.push_back(loop_arc{backward_ ? lk.exit_ : lk.entry_,
-                                        backward_ ? lk.entry_ : lk.exit_,
-                                        kInfeasible});
-    }
-    return {scratch_loops_.data(), scratch_loops_.size()};
-  }
-
-  std::vector<loop_arc> scratch_loops_;
   bool backward_{false};
   bool packed_{false};
   bool materialized_{false};

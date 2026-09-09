@@ -174,7 +174,7 @@ struct cch_node_turns {
     r_ = w.r_.get();
     timezones_ = &w.timezones_;
     n_ = c.order_[rank];
-    ports_ = std::min(n_ports(*r_, n_), kMaxPorts);
+    ports_ = n_capped_ports(*r_, n_);
     has_loops_ = false;
 
     auto const loops = c.loop_entries(rank);
@@ -187,50 +187,38 @@ struct cch_node_turns {
     for (auto i = port_t{0U}; i != ports_; ++i) {
       auto* const d = &dist_[i * kMaxPorts];
       d[i] = 0U;
-      auto done = std::uint32_t{0U};
-      for (auto it = port_t{0U}; it != ports_; ++it) {
-        auto best = kInfeasible;
-        auto at = kMaxPorts;
-        for (auto k = port_t{0U}; k != ports_; ++k) {
-          if ((done & (std::uint32_t{1U} << k)) == 0U && d[k] < best) {
-            best = d[k];
-            at = k;
-          }
-        }
-        if (at == kMaxPorts) {
-          break;
-        }
-        done |= std::uint32_t{1U} << at;
-        for (auto e = std::size_t{0U}; e != loops.size(); ++e) {
-          auto const weight = loop_weight(c.loop_begin(rank) + e);
-          if (weight == kInfeasible || loops[e].exit_ >= ports_) {
-            continue;
-          }
-          auto const turn = plain(at, loops[e].entry_);
-          if (turn == kInfeasible) {
-            continue;
-          }
-          auto const cost = clamp_cost(static_cast<std::uint64_t>(best) +
-                                       turn + weight);
-          if (cost < d[loops[e].exit_]) {
-            d[loops[e].exit_] = cost;
-            pred_port_[i * kMaxPorts + loops[e].exit_] = at;
-            pred_loop_[i * kMaxPorts + loops[e].exit_] =
-                static_cast<cch_entry_idx_t>(c.loop_begin(rank) + e);
-          }
-        }
-      }
+      for_ports_by_cost(
+          ports_, [&](port_t const k) { return d[k]; },
+          [&](port_t const at, cost_t const best) {
+            for (auto e = std::size_t{0U}; e != loops.size(); ++e) {
+              auto const weight = loop_weight(c.loop_begin(rank) + e);
+              if (weight == kInfeasible || loops[e].exit_ >= ports_) {
+                continue;
+              }
+              auto const turn = plain(at, loops[e].entry_);
+              if (turn == kInfeasible) {
+                continue;
+              }
+              auto const cost = clamp_cost(static_cast<std::uint64_t>(best) +
+                                           turn + weight);
+              if (cost < d[loops[e].exit_]) {
+                d[loops[e].exit_] = cost;
+                pred_port_[i * kMaxPorts + loops[e].exit_] = at;
+                pred_loop_[i * kMaxPorts + loops[e].exit_] =
+                    c.loop_begin(rank) + e;
+              }
+            }
+          });
     }
     has_loops_ = true;
   }
 
-  // Cost of the turn plus the self loops it needs, appending the loop entries
-  // that have to be driven (in travel order) to `loops`.
-  cost_t chain(port_t const in,
-               port_t const out,
-               std::vector<cch_entry_idx_t>& loops) const {
+  // Cheapest way from `in` to `out`: either the plain turn, or the loops that
+  // lead to another arriving port plus the turn from there. Returns the cost
+  // and that intermediate port, which is `in` itself if no loop helps.
+  std::pair<cost_t, port_t> best_via(port_t const in, port_t const out) const {
     auto best = plain(in, out);
-    auto best_via = in;
+    auto via = in;
     if (has_loops_ && in < ports_) {
       for (auto k = port_t{0U}; k != ports_; ++k) {
         auto const d = dist_[in * kMaxPorts + k];
@@ -241,16 +229,24 @@ struct cch_node_turns {
         if (turn == kInfeasible) {
           continue;
         }
-        auto const total =
-            clamp_cost(static_cast<std::uint64_t>(d) + turn);
+        auto const total = clamp_cost(static_cast<std::uint64_t>(d) + turn);
         if (total < best) {
           best = total;
-          best_via = k;
+          via = k;
         }
       }
     }
+    return {best, via};
+  }
+
+  // Same, appending the loop entries that have to be driven (in travel order)
+  // to `loops`.
+  cost_t chain(port_t const in,
+               port_t const out,
+               std::vector<cch_entry_idx_t>& loops) const {
+    auto const [best, via] = best_via(in, out);
     auto const first = loops.size();
-    for (auto k = best_via; k != in;) {
+    for (auto k = via; k != in;) {
       loops.emplace_back(pred_loop_[in * kMaxPorts + k]);
       k = pred_port_[in * kMaxPorts + k];
     }
@@ -264,22 +260,7 @@ struct cch_node_turns {
   }
 
   cost_t operator()(port_t const in, port_t const out) const {
-    auto best = plain(in, out);
-    if (!has_loops_ || in >= ports_) {
-      return best;
-    }
-    for (auto k = port_t{0U}; k != ports_; ++k) {
-      auto const d = dist_[in * kMaxPorts + k];
-      if (d == kInfeasible || d == 0U) {
-        continue;
-      }
-      auto const turn = plain(k, out);
-      if (turn == kInfeasible) {
-        continue;
-      }
-      best = std::min(best, clamp_cost(static_cast<std::uint64_t>(d) + turn));
-    }
-    return best;
+    return best_via(in, out).first;
   }
 
   typename P::parameters const* params_{nullptr};
@@ -329,16 +310,6 @@ inline void relax_min(cost_t& weight, cost_t const cost) {
                                     std::memory_order_relaxed)) {
   }
 }
-
-// Most of the work sits in the few, very dense levels at the top of the
-// hierarchy: on Hamburg, levels with less than 64 nodes hold 83% of it. Those
-// levels cannot be spread over their nodes, so they are spread over the
-// (node, upper slot) pairs instead -- distinct slots of a node compose
-// distinct arcs, so this is as race free as the split by node. The turn
-// closures of the whole level have to be held at once for that, which is why
-// wide levels -- cheap, and there can be tens of thousands of them -- keep
-// using the split by node.
-constexpr auto const kMaxSlotParallelLevel = std::size_t{1024U};
 
 }  // namespace cch_detail
 
@@ -390,33 +361,14 @@ void customize(typename P::parameters const& params,
                 return;
               }
 
-              if (v == u) {
-                auto const entries = c.loop_entries(rank);
-                auto const idx =
-                    cch::find_entry(entries, cch_entry{tail_port, head_port});
-                if (idx != std::numeric_limits<cch_entry_idx_t>::max()) {
-                  auto& weight = w_loop[c.loop_begin(rank) + idx];
-                  weight = std::min(weight, cost);
-                }
+              auto const ref =
+                  c.find_edge(rank, v, cch_entry{tail_port, head_port});
+              if (ref.kind_ == cch_arc::kNone) {
                 return;
               }
-
-              auto const other = c.rank_[v];
-              auto const up = rank < other;
-              auto const slot =
-                  up ? c.find_slot(rank, other) : c.find_slot(other, rank);
-              if (slot == cch::kNoSlot) {
-                return;
-              }
-              auto const entries =
-                  up ? c.up_entries(slot) : c.dn_entries(slot);
-              auto const idx =
-                  cch::find_entry(entries, cch_entry{tail_port, head_port});
-              if (idx == std::numeric_limits<cch_entry_idx_t>::max()) {
-                return;
-              }
-              auto& weight = (up ? w_up[c.up_ofs_[slot] + idx]
-                                 : w_dn[c.dn_ofs_[slot] + idx]);
+              auto& weight = (ref.kind_ == cch_arc::kUp     ? w_up
+                              : ref.kind_ == cch_arc::kDn   ? w_dn
+                                                            : w_loop)[ref.idx_];
               weight = std::min(weight, cost);
             });
       },
@@ -524,7 +476,7 @@ void customize(typename P::parameters const& params,
                                          turn + c2);
             auto const idx = cch::find_entry(
                 t_entries, cch_entry{in[e1].entry_, out[e2].exit_});
-            if (idx == std::numeric_limits<cch_entry_idx_t>::max()) {
+            if (idx == kNoEntry) {
               ++st.missing_entries_;
               continue;
             }
@@ -554,19 +506,26 @@ void customize(typename P::parameters const& params,
   pt->status("CCH Customization").in_high(n);
   auto done = std::size_t{0U};
 
+  auto const loop_weight = [&](cch_entry_idx_t const i) { return w_loop[i]; };
+
   auto turns = std::vector<cch_node_turns<P>>{};
   auto slot_jobs = std::vector<std::pair<std::uint32_t, cch_slot_idx_t>>{};
 
   for (auto const& lvl : by_level) {
-    if (lvl.size() > cch_detail::kMaxSlotParallelLevel) {
+    // Most of the work sits in the few, very dense levels at the top: on
+    // Hamburg, levels with less than 64 nodes hold 83% of it. Those cannot be
+    // spread over their nodes, so they are spread over the (node, upper slot)
+    // pairs instead -- distinct slots of a node compose distinct arcs, so that
+    // is as race free as the split by node. It needs the turn closures of the
+    // whole level at once, which is why wide levels -- cheap, and there can be
+    // tens of thousands of them -- keep using the split by node.
+    if (lvl.size() > kLevelParallelCutoff) {
       // wide level: one job per node, every worker reusing its turn closure
       utl::parallel_for_run_threadlocal<cch_node_turns<P>>(
           lvl.size(),
           [&](cch_node_turns<P>& turns_of_worker, std::size_t const i) {
             auto const rank = lvl[i];
-            turns_of_worker.reset(params, w, c,
-                                  [&](cch_entry_idx_t const i) { return w_loop[i]; },
-                                  rank);
+            turns_of_worker.reset(params, w, c, loop_weight, rank);
             auto cnt = counters{};
             process_slots(rank, turns_of_worker, c.upper_begin(rank),
                           c.upper_end(rank), cnt);
@@ -579,9 +538,9 @@ void customize(typename P::parameters const& params,
       turns.resize(std::max(turns.size(), lvl.size()));
       utl::parallel_for_run(
           lvl.size(),
-          [&](std::size_t const i) { turns[i].reset(params, w, c,
-                           [&](cch_entry_idx_t const k) { return w_loop[k]; },
-                           lvl[i]); },
+          [&](std::size_t const i) {
+            turns[i].reset(params, w, c, loop_weight, lvl[i]);
+          },
           utl::noop_progress_update{},
           utl::parallel_error_strategy::QUIT_EXEC, n_threads);
 

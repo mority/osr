@@ -3,11 +3,14 @@
 #include <cinttypes>
 
 #include <limits>
+#include <optional>
+#include <span>
 #include <vector>
 
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/query.h"
+#include "osr/routing/cch/sweep.h"
 #include "osr/routing/cch/turns.h"
 #include "osr/routing/profile.h"
 #include "osr/types.h"
@@ -115,17 +118,11 @@ struct lazy_rphast {
     if (idx == kNone) {
       return kInfeasible;
     }
-    auto const ports = ports_of(*w.r_, c, rk);
-    return p < ports ? cost_[idx + p] : kInfeasible;
+    return p < n_capped_ports(*w.r_, c.order_[rk]) ? cost_[idx + p]
+                                                   : kInfeasible;
   }
 
 private:
-  static port_t ports_of(ways::routing const& r,
-                         cch const& c,
-                         cch_rank_t const rk) {
-    return std::min(n_ports(r, c.order_[rk]), kMaxPorts);
-  }
-
   void reset_memo() {
     for (auto const rk : touched_) {
       pos_[to_idx(rk)] = kNone;
@@ -190,133 +187,46 @@ private:
                cch_metric const& m,
                cch_rank_t const rk) {
     auto const& r = *w.r_;
-    auto const nd = c.order_[rk];
-    auto const ports = ports_of(r, c, rk);
-
-    auto const base = static_cast<std::uint32_t>(cost_.size());
-    cost_.resize(cost_.size() + ports, kInfeasible);
-    pos_[to_idx(rk)] = base;
+    auto const here = cch_sweep_node{static_cast<std::uint32_t>(cost_.size()),
+                                     n_capped_ports(r, c.order_[rk]),
+                                     c.order_[rk]};
+    cost_.resize(cost_.size() + here.ports_, kInfeasible);
+    pos_[to_idx(rk)] = here.base_;
     touched_.push_back(rk);
 
     // Seed with the tentative distance from the source's upward search. For a
     // node the source never reached this is simply absent.
     auto const& up = backward_ ? search_.backward() : search_.forward();
     if (auto const it = up.find(to_idx(rk)); it != end(up)) {
-      for (auto q = port_t{0U}; q != ports; ++q) {
+      for (auto q = port_t{0U}; q != here.ports_; ++q) {
         auto const cu = it->second.cost_[q];
-        if (cu < cost_[base + q]) {
-          cost_[base + q] = cu;
+        if (cu < cost_[here.base_ + q]) {
+          cost_[here.base_ + q] = cu;
         }
       }
     }
 
-    auto const turn = [&](node_idx_t const at, port_t const in,
-                          port_t const out) {
-      return cch_turn_cost<P>(params, r, w.timezones_, at, in, out);
-    };
+    auto const turn = cch_turn_fn<P>(params, w);
 
-    // Pull along the downward arcs that end here.
-    for (auto s = c.upper_begin(rk); s != c.upper_end(rk); ++s) {
-      auto const entries = backward_ ? c.up_entries(s) : c.dn_entries(s);
-      if (entries.empty()) {
-        continue;
-      }
-      auto const h = c.adj_head_[s];
-      auto const hidx = pos_[to_idx(h)];
-      if (hidx == kNone) {
-        continue;  // cannot happen: `resolve` made every tail final first
-      }
-      auto const hports = ports_of(r, c, h);
-      auto const hn = c.order_[h];
-      auto const ofs = backward_ ? c.up_ofs_[s] : c.dn_ofs_[s];
-      for (auto k = std::size_t{0U}; k != entries.size(); ++k) {
-        auto const e = entries[k];
-        auto const tail_port = backward_ ? e.exit_ : e.entry_;
-        auto const head_port = backward_ ? e.entry_ : e.exit_;
-        if (head_port >= ports || tail_port >= hports) {
-          continue;
-        }
-        auto const weight = backward_ ? m.up(ofs + k) : m.dn(ofs + k);
-        if (weight == kInfeasible) {
-          continue;
-        }
-        auto& dst = cost_[base + head_port];
-        for (auto q = port_t{0U}; q != hports; ++q) {
-          auto const ch = cost_[hidx + q];
-          if (ch == kInfeasible) {
-            continue;
-          }
-          auto const tc =
-              backward_ ? turn(hn, tail_port, q) : turn(hn, q, tail_port);
-          if (tc == kInfeasible) {
-            continue;
-          }
-          auto const nc =
-              clamp_cost(static_cast<std::uint64_t>(ch) + tc + weight);
-          if (nc < max_ && nc < dst) {
-            dst = nc;
-          }
-        }
-      }
-    }
+    cch_relax_dn_arcs(
+        c, m, rk, backward_, max_, here, cost_,
+        [&](cch_rank_t const h) -> std::optional<cch_sweep_node> {
+          auto const hidx = pos_[to_idx(h)];
+          // kNone cannot happen: `resolve` made every tail final first
+          return hidx == kNone
+                     ? std::nullopt
+                     : std::optional{cch_sweep_node{
+                           hidx, n_capped_ports(r, c.order_[h]), c.order_[h]}};
+        },
+        turn);
 
-    close_loops(c, m, rk, base, ports, [&](port_t const in, port_t const out) {
-      return turn(nd, in, out);
-    });
-  }
-
-  // A self loop leaves the node and comes back on a different port, which is
-  // how a forbidden turn gets driven around. Ports are closed cheapest first
-  // so one pass suffices, mirroring the eager sweep.
-  template <typename TurnFn>
-  void close_loops(cch const& c,
-                   cch_metric const& m,
-                   cch_rank_t const rk,
-                   std::uint32_t const base,
-                   port_t const ports,
-                   TurnFn const& turn) {
-    auto const loops = c.loop_entries(rk);
-    if (loops.empty()) {
-      return;
-    }
-    auto const loop_base = c.loop_begin(rk);
-
-    auto done = std::uint32_t{0U};
-    for (auto step = port_t{0U}; step != ports; ++step) {
-      auto best = kInfeasible;
-      auto at = kMaxPorts;
-      for (auto q = port_t{0U}; q != ports; ++q) {
-        if ((done & (std::uint32_t{1U} << q)) == 0U && cost_[base + q] < best) {
-          best = cost_[base + q];
-          at = q;
-        }
-      }
-      if (at == kMaxPorts) {
-        break;
-      }
-      done |= std::uint32_t{1U} << at;
-
-      for (auto k = std::size_t{0U}; k != loops.size(); ++k) {
-        auto const entry = backward_ ? loops[k].exit_ : loops[k].entry_;
-        auto const exit = backward_ ? loops[k].entry_ : loops[k].exit_;
-        if (entry >= ports || exit >= ports) {
-          continue;
-        }
-        auto const wgt =
-            m.loop(static_cast<cch_entry_idx_t>(loop_base + k));
-        if (wgt == kInfeasible) {
-          continue;
-        }
-        auto const tc = backward_ ? turn(entry, at) : turn(at, entry);
-        if (tc == kInfeasible) {
-          continue;
-        }
-        auto const nc = clamp_cost(static_cast<std::uint64_t>(best) + tc + wgt);
-        if (nc < max_ && nc < cost_[base + exit]) {
-          cost_[base + exit] = nc;
-        }
-      }
-    }
+    cch_close_loops(
+        std::span{cost_}.subspan(here.base_, here.ports_), here.ports_, max_,
+        backward_, c.loop_entries(rk),
+        [&](std::size_t const k) { return m.loop(c.loop_begin(rk) + k); },
+        [&](port_t const in, port_t const out) {
+          return turn(here.node_, in, out);
+        });
   }
 
   cch_search<P> search_;

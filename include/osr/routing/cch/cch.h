@@ -37,6 +37,10 @@ using port_t = std::uint8_t;
 
 constexpr auto const kMaxPorts = port_t{32U};
 
+// `for_ports_by_cost` tracks the settled ports in a `std::uint32_t` bit mask,
+// so a node can have at most as many addressable ports as that has bits.
+static_assert(kMaxPorts <= 32U);
+
 constexpr port_t make_port(way_pos_t const way_pos, direction const dir) {
   return static_cast<port_t>((way_pos << 1U) |
                              (dir == direction::kBackward ? 1U : 0U));
@@ -60,6 +64,48 @@ constexpr port_t n_ports(ways::routing const& r, node_idx_t const n) {
   return static_cast<port_t>(r.node_ways_[n].size() << 1U);
 }
 
+// Ports a node actually has labels for: the per port arrays are `kMaxPorts`
+// wide, so the ports of a node that sits on more ways than that are not
+// addressable and are ignored throughout.
+constexpr port_t n_capped_ports(ways::routing const& r, node_idx_t const n) {
+  return std::min(n_ports(r, n), kMaxPorts);
+}
+
+// Visits the ports of a node in increasing cost order, i.e. settles them the
+// way a Dijkstra over the ports would. `cost_of` is read afresh on every step,
+// so a port that an earlier `fn` improved is picked up at its new cost. With
+// at most `kMaxPorts` ports a linear scan per step beats a heap.
+template <typename CostFn, typename Fn>
+void for_ports_by_cost(port_t const ports,
+                       CostFn const& cost_of,
+                       Fn const& fn) {
+  auto done = std::uint32_t{0U};
+  for (auto step = port_t{0U}; step != ports; ++step) {
+    auto best = kInfeasible;
+    auto at = kMaxPorts;
+    for (auto p = port_t{0U}; p != ports; ++p) {
+      auto const c = cost_of(p);
+      if ((done & (std::uint32_t{1U} << p)) == 0U && c < best) {
+        best = c;
+        at = p;
+      }
+    }
+    if (at == kMaxPorts) {
+      return;
+    }
+    done |= std::uint32_t{1U} << at;
+    fn(at, best);
+  }
+}
+
+// Above this many nodes a level of the elimination tree is spread over its
+// nodes, below it over the (node, upper slot) pairs. Most of the work sits in
+// the few very dense levels at the top, and those cannot be spread over their
+// nodes; splitting a level by slot needs the whole level's per node state to be
+// held at once, which only pays where the level is narrow. The contraction and
+// the customization walk the levels the same way and share the cutoff.
+constexpr auto const kLevelParallelCutoff = std::size_t{1024U};
+
 // One (directed) arc of the contraction hierarchy. The pair of nodes it
 // connects is given by the adjacency slot it belongs to, the two ports say
 // which original edge the represented path starts / ends with. This is how turn
@@ -75,6 +121,17 @@ struct cch_entry {
 };
 
 static_assert(sizeof(cch_entry) == 2U);
+
+// "no such entry", returned by the entry lookups.
+constexpr auto const kNoEntry = std::numeric_limits<cch_entry_idx_t>::max();
+
+// Which of the three entry arrays an arc lives in.
+enum class cch_arc : std::uint8_t { kNone, kUp, kDn, kLoop };
+
+struct cch_edge_ref {
+  cch_arc kind_{cch_arc::kNone};
+  cch_entry_idx_t idx_{kNoEntry};  // absolute index into that array
+};
 
 // Metric independent part of the customizable contraction hierarchy.
 //
@@ -104,19 +161,15 @@ struct cch {
     return n < rank_.size() && rank_[n] != cch_rank_t::invalid();
   }
 
-  // These CSR accessors take the base pointer as `data() + ofs` rather than
-  // `&vec[ofs]`: for the last entry `ofs` equals `size()`, and forming a
-  // reference to the one-past-the-end element trips cista's bounds check in
-  // debug builds even though the resulting span is empty.
-  std::span<cch_rank_t const> upper(cch_rank_t const r) const {
-    return {adj_head_.data() + adj_ofs_[r], adj_ofs_[r + 1U] - adj_ofs_[r]};
-  }
-
   cch_slot_idx_t upper_begin(cch_rank_t const r) const { return adj_ofs_[r]; }
   cch_slot_idx_t upper_end(cch_rank_t const r) const {
     return adj_ofs_[r + 1U];
   }
 
+  // These CSR accessors take the base pointer as `data() + ofs` rather than
+  // `&vec[ofs]`: for the last entry `ofs` equals `size()`, and forming a
+  // reference to the one-past-the-end element trips cista's bounds check in
+  // debug builds even though the resulting span is empty.
   std::span<std::uint32_t const> lower_slots(cch_rank_t const r) const {
     return {lower_slot_.data() + lower_ofs_[r],
             lower_ofs_[r + 1U] - lower_ofs_[r]};
@@ -173,9 +226,46 @@ struct cch {
                                     cch_entry const e) {
     auto const it = std::lower_bound(begin(entries), end(entries), e);
     return (it == end(entries) || *it != e)
-               ? std::numeric_limits<cch_entry_idx_t>::max()
+               ? kNoEntry
                : static_cast<cch_entry_idx_t>(
                      std::distance(begin(entries), it));
+  }
+
+  // Node a self loop belongs to, the same derivation `tail` does for a slot.
+  cch_rank_t loop_owner(cch_entry_idx_t const idx) const {
+    auto const it = std::upper_bound(begin(loop_ofs_), end(loop_ofs_), idx);
+    auto const r = static_cast<cch_rank_t::value_t>(
+        std::distance(begin(loop_ofs_), it) - 1);
+    return r < n_ranks() ? cch_rank_t{r} : cch_rank_t::invalid();
+  }
+
+  // Locates the original edge from the node of rank `u` to `v` whose first and
+  // last port are `e`: which of the three entry arrays holds it and where.
+  // `kNone` if the hierarchy does not represent it -- `v` outside the sub
+  // graph, or a pair the contraction produced no slot or no entry for.
+  cch_edge_ref find_edge(cch_rank_t const u,
+                         node_idx_t const v,
+                         cch_entry const e) const {
+    if (!contains(v)) {
+      return {};
+    }
+    auto const other = rank_[v];
+    if (other == u) {
+      auto const idx = find_entry(loop_entries(u), e);
+      return idx == kNoEntry
+                 ? cch_edge_ref{}
+                 : cch_edge_ref{cch_arc::kLoop, loop_begin(u) + idx};
+    }
+    auto const up = u < other;
+    auto const slot = up ? find_slot(u, other) : find_slot(other, u);
+    if (slot == kNoSlot) {
+      return {};
+    }
+    auto const idx = find_entry(up ? up_entries(slot) : dn_entries(slot), e);
+    return idx == kNoEntry
+               ? cch_edge_ref{}
+               : cch_edge_ref{up ? cch_arc::kUp : cch_arc::kDn,
+                              (up ? up_ofs_[slot] : dn_ofs_[slot]) + idx};
   }
 
   // node -> rank (invalid for nodes that are not part of the hierarchy)

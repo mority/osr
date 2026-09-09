@@ -865,34 +865,18 @@ cch_registry& get_cch_registry() {
   return r;
 }
 
+// The CCH searches carry rank sized scratch arrays, so a request reuses the
+// one its thread already has instead of allocating them again.
+template <typename T>
+T& thread_local_search() {
+  static auto s = boost::thread_specific_ptr<T>{};
+  if (s.get() == nullptr) {
+    s.reset(new T{});
+  }
+  return *s.get();
+}
+
 }  // namespace
-
-template <WayAwareProfile P>
-cch_search<P>& get_cch_search() {
-  static auto s = boost::thread_specific_ptr<cch_search<P>>{};
-  if (s.get() == nullptr) {
-    s.reset(new cch_search<P>{});
-  }
-  return *s.get();
-}
-
-template <Profile P>
-lazy_rphast<P>& get_lazy_rphast() {
-  static auto s = boost::thread_specific_ptr<lazy_rphast<P>>{};
-  if (s.get() == nullptr) {
-    s.reset(new lazy_rphast<P>{});
-  }
-  return *s.get();
-}
-
-template <Profile P>
-rphast<P>& get_rphast() {
-  static auto s = boost::thread_specific_ptr<rphast<P>>{};
-  if (s.get() == nullptr) {
-    s.reset(new rphast<P>{});
-  }
-  return *s.get();
-}
 
 template <WayAwareProfile P>
 path reconstruct_cch(typename P::parameters const& params,
@@ -1719,8 +1703,10 @@ std::vector<std::optional<path>> route(
             auto const m = get_cch_registry().metric(
                 w.p_, profile, blob,
                 [&](cch_metric& out) { customize<P>(pp, w, *c, out); });
-            return route_rphast<P>(pp, w, *c, *m, get_rphast<P>(),
-                                   get_lazy_rphast<P>(), from, to, from_match,
+            return route_rphast<P>(pp, w, *c, *m,
+                                   thread_local_search<rphast<P>>(),
+                                   thread_local_search<lazy_rphast<P>>(), from,
+                                   to, from_match,
                                    to_match, max, dir);
           } else {
             throw utl::fail("cch not supported for profile {}",
@@ -1773,7 +1759,8 @@ std::optional<path> route_cch(profile_parameters const& params,
       auto const m = get_cch_registry().metric(
           w.p_, profile, blob,
           [&](cch_metric& out) { customize<P>(pp, w, *c, out); });
-      return route_cch<P>(pp, w, l, *c, *m, get_cch_search<P>(), from, to,
+      return route_cch<P>(pp, w, l, *c, *m,
+                          thread_local_search<cch_search<P>>(), from, to,
                           from_match, to_match, max, dir);
     } else {
       throw utl::fail("cch not supported for profile {}", to_str(profile));
