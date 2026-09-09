@@ -12,6 +12,7 @@
 #include "osr/routing/cch/query.h"
 #include "osr/routing/cch/sweep.h"
 #include "osr/routing/cch/turns.h"
+#include "utl/helpers/algorithm.h"
 #include "utl/verify.h"
 
 #include "osr/types.h"
@@ -161,7 +162,7 @@ struct rphast {
     // Decreasing rank, so that every node is final by the time a lower one
     // pulls from it -- and so that a tail always sits earlier in the arrays
     // than its head, which is what makes the sweep a forward walk.
-    std::sort(begin(order_), end(order_), std::greater<>{});
+    utl::sort(order_, std::greater<>{});
 
     auto const n = order_.size();
     node_.resize(n);

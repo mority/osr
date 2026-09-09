@@ -11,6 +11,7 @@
 #include <span>
 #include <vector>
 
+#include "utl/erase_duplicates.h"
 #include "utl/helpers/algorithm.h"
 #include "utl/parallel_for.h"
 #include "utl/progress_tracker.h"
@@ -335,12 +336,6 @@ struct contractor {
     return !is_restricted_for_all(r_, n, port_way_pos(in), port_way_pos(out));
   }
 
-  template <typename T>
-  void dedup(std::vector<T>& v) const {
-    std::sort(begin(v), end(v));
-    v.erase(std::unique(begin(v), end(v)), end(v));
-  }
-
   // Below this an LSD pass costs more than it saves.
   static constexpr auto const kRadixMin = std::size_t{2048U};
 
@@ -416,7 +411,7 @@ struct contractor {
     auto& v = loops_[at];
     v.emplace_back(e);
     if (v.size() > 64U) {
-      dedup(v);
+      utl::erase_duplicates(v);
     }
   }
 
@@ -533,7 +528,7 @@ struct contractor {
     clean_size_[i] = v.size();
 
     auto& lp = loops_[i];
-    dedup(lp);
+    utl::erase_duplicates(lp);
     auto const ports = n_capped_ports(r_, node);
     build_allowed(s, node, std::span<cch_entry const>{lp}, ports);
 
@@ -1046,12 +1041,9 @@ cista::wrapped<cch> build_cch(ways const& w, unsigned const n_threads) {
                               adj.emplace_back(l);
                             }
                           });
-            std::sort(begin(adj) + static_cast<std::ptrdiff_t>(before),
-                      end(adj));
-            adj.erase(
-                std::unique(begin(adj) + static_cast<std::ptrdiff_t>(before),
-                            end(adj)),
-                end(adj));
+            utl::erase_duplicates(
+                adj, begin(adj) + static_cast<std::ptrdiff_t>(before),
+                end(adj), std::less<>{}, std::equal_to<>{});
             g.ofs_[u + 1U] = adj.size() - before;  // degree, summed below
           }
         },
