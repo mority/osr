@@ -141,6 +141,11 @@ target_link_libraries(osr-extract osr conf ${osr-resource-libs})
 add_executable(osr-benchmark exe/benchmark.cc)
 target_link_libraries(osr-benchmark osr conf ${osr-resource-libs})
 
+# Measurement harness for area routing. Links expat so it can read the .osm XML
+# dumps in material/ directly, without a pbf conversion step.
+add_executable(osr-area-stats exe/area-stats.cc)
+target_link_libraries(osr-area-stats osr conf expat ${osr-resource-libs})
+
 file(GLOB_RECURSE osr-backend-src exe/backend/*.cc)
 add_executable(osr-backend ${osr-backend-src})
 target_link_libraries(osr-backend osr web-server conf boost-json ${osr-resource-libs})
