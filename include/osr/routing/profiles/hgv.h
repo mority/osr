@@ -30,6 +30,9 @@ struct sharing_data;
 struct hgv {
   static constexpr auto const kName = "hgv";
   static constexpr auto const kMaxMatchDistance = 200U;
+  // A lorry is not a bus, so the bus specific turn restriction exemptions do
+  // not apply. See `generic_car::kIsBus`.
+  static constexpr auto const kIsBus = false;
   static constexpr auto const kExactBidirectional = true;
   static constexpr auto const kDetourCostFactor = 0.9F;
 

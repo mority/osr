@@ -3,14 +3,12 @@
 #include <cinttypes>
 
 #include <limits>
-#include <optional>
 #include <span>
 #include <vector>
 
 #include "osr/routing/cch/cch.h"
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/query.h"
-#include "osr/routing/cch/sweep.h"
 #include "osr/routing/cch/turns.h"
 #include "osr/routing/profile.h"
 #include "osr/types.h"
@@ -25,12 +23,11 @@ namespace osr {
 //   Bläsius, Buchhold, Wagner, Zeitz, Zündorf: "Customizable Contraction
 //   Hierarchies - A Survey", Algorithm 4.1.
 //
-// The difference to `rphast` in this directory is where the work goes.
-// Eager RPHAST selects T', the upward closure of the whole target set, and
-// then sweeps every node of it once per source. Its cost is O(|T'|) no matter
-// how many of the targets are actually read, and on a country sized hierarchy
-// the closure always climbs into the dense top levels, so even a handful of
-// targets pays for the whole ascent.
+// Eager RPHAST (Delling/Goldberg/Werneck, ATMOS 2011) selects T', the upward
+// closure of the whole target set, and sweeps every node of it once per source.
+// Its cost is O(|T'|) no matter how many of the targets are actually read, and
+// on a country sized hierarchy the closure always climbs into the dense top
+// levels, so even a handful of targets pays for the whole ascent.
 //
 // Lazy RPHAST has no selection phase and no sweep. For a target u it walks up
 // the elimination tree until it meets a node whose distance is already known,
@@ -39,18 +36,24 @@ namespace osr {
 // earlier ones already paid for, so the shared upper region is computed once
 // and the marginal cost of a target is the length of its own private tail.
 //
-// The recurrence is the same one the eager sweep applies, only evaluated on
-// demand:
+// The eager variant used to live next to this one, behind an env var. It was
+// removed after measuring both on Germany: reading *every* target the two do
+// provably identical work -- the memo ends up holding exactly |T'| nodes -- and
+// lazy still won on constant factors (0.99x to 1.05x). Reading a quarter of
+// them it won by 1.3x to 1.6x, and the advantage grows as the read fraction
+// falls. Lazy is bounded above by eager by construction: it can never touch
+// more of the hierarchy than the closure eager commits to up front.
+//
+// The recurrence is the one the eager sweep applies, only evaluated on demand:
 //
 //   D[v] = min( D_up[v], min over upward arcs v->w of ( l_dn[w->v] + D[w] ) )
 //
 // where `D_up` is the tentative distance from the source's upward search.
 //
-// Turn awareness works exactly as in `rphast`: a label is one cost per
-// (node, port) rather than per node, the relaxation charges the turn taken at
-// the tail node, and after pulling from the higher ranked neighbours the self
-// loops at the node have to be closed so a forbidden turn can be driven
-// around.
+// Turn awareness: a label is one cost per (node, port) rather than per node,
+// the relaxation charges the turn taken at the tail node, and after pulling
+// from the higher ranked neighbours the self loops at the node have to be
+// closed so a forbidden turn can be driven around.
 template <Profile P>
 struct lazy_rphast {
   static constexpr auto const kNone = std::numeric_limits<std::uint32_t>::max();
@@ -60,8 +63,6 @@ struct lazy_rphast {
     reset_memo();
   }
 
-  void clear_starts() { search_.clear_starts(); }
-
   void add_start(cch const& c,
                  node_idx_t const n,
                  port_t const p,
@@ -70,11 +71,6 @@ struct lazy_rphast {
   }
 
   bool no_starts() const { return search_.no_starts(); }
-
-  // How many nodes the memo holds, i.e. how much of the hierarchy this source
-  // actually had to touch. The eager equivalent is `n_selected()`, which is
-  // fixed by the target set before the first distance is read.
-  std::size_t n_memoized() const { return touched_.size(); }
 
   // ---- phase 1: the source ------------------------------------------------
   //
@@ -88,8 +84,7 @@ struct lazy_rphast {
            bool const backward = false) {
     backward_ = backward;
     max_ = max;
-    auto const ok = backward ? search_.run_backward(params, w, c, m, max)
-                             : search_.run_forward(params, w, c, m, max);
+    auto const ok = search_.run_upward(params, w, c, m, max, backward);
     reset_memo();
     if (pos_.size() != c.n_ranks()) {
       pos_.assign(c.n_ranks(), kNone);
@@ -187,49 +182,117 @@ private:
                cch_metric const& m,
                cch_rank_t const rk) {
     auto const& r = *w.r_;
-    auto const here = cch_sweep_node{static_cast<std::uint32_t>(cost_.size()),
-                                     n_capped_ports(r, c.order_[rk]),
-                                     c.order_[rk]};
-    cost_.resize(cost_.size() + here.ports_, kInfeasible);
-    pos_[to_idx(rk)] = here.base_;
+    auto const node = c.order_[rk];
+    auto const ports = n_capped_ports(r, node);
+    auto const base = static_cast<std::uint32_t>(cost_.size());
+    cost_.resize(cost_.size() + ports, kInfeasible);
+    pos_[to_idx(rk)] = base;
     touched_.push_back(rk);
 
     // Seed with the tentative distance from the source's upward search. For a
     // node the source never reached this is simply absent.
     auto const& up = backward_ ? search_.backward() : search_.forward();
     if (auto const it = up.find(to_idx(rk)); it != end(up)) {
-      for (auto q = port_t{0U}; q != here.ports_; ++q) {
+      for (auto q = port_t{0U}; q != ports; ++q) {
         auto const cu = it->second.cost_[q];
-        if (cu < cost_[here.base_ + q]) {
-          cost_[here.base_ + q] = cu;
+        if (cu < cost_[base + q]) {
+          cost_[base + q] = cu;
         }
       }
     }
 
     auto const turn = cch_turn_fn<P>(params, w);
 
-    cch_relax_dn_arcs(
-        c, m, rk, backward_, max_, here, cost_,
-        [&](cch_rank_t const h) -> std::optional<cch_sweep_node> {
-          auto const hidx = pos_[to_idx(h)];
-          // kNone cannot happen: `resolve` made every tail final first
-          return hidx == kNone
-                     ? std::nullopt
-                     : std::optional{cch_sweep_node{
-                           hidx, n_capped_ports(r, c.order_[h]), c.order_[h]}};
-        },
-        turn);
+    // Pull from the downward arcs that end here:
+    //
+    //   D[v] = min( D_up[v], min over downward arcs w->v of ( l[w->v] + D[w] ) )
+    //
+    // The tails rank higher, so `resolve` made every one of them final before
+    // this runs. Reversed, the downward arcs of the search are the `up_` arcs
+    // of the hierarchy, and the turn at the tail is taken arriving on the arc
+    // and leaving by the port the state already holds, so both the entry list
+    // and the two port roles swap.
+    for (auto s = c.upper_begin(rk); s != c.upper_end(rk); ++s) {
+      auto const entries = backward_ ? c.up_entries(s) : c.dn_entries(s);
+      if (entries.empty()) {
+        continue;
+      }
+      auto const h = c.adj_head_[s];
+      auto const tail_base = pos_[to_idx(h)];
+      if (tail_base == kNone) {
+        continue;  // cannot happen: `resolve` made every tail final first
+      }
+      auto const tail_node = c.order_[h];
+      auto const tail_ports = n_capped_ports(r, tail_node);
+      auto const ofs = backward_ ? c.up_ofs_[s] : c.dn_ofs_[s];
+      for (auto k = std::size_t{0U}; k != entries.size(); ++k) {
+        auto const e = entries[k];
+        auto const tail_port = backward_ ? e.exit_ : e.entry_;
+        auto const head_port = backward_ ? e.entry_ : e.exit_;
+        if (head_port >= ports || tail_port >= tail_ports) {
+          continue;
+        }
+        auto const weight = backward_ ? m.up(ofs + k) : m.dn(ofs + k);
+        if (weight == kInfeasible) {
+          continue;
+        }
+        auto& dst = cost_[base + head_port];
+        for (auto q = port_t{0U}; q != tail_ports; ++q) {
+          auto const ch = cost_[tail_base + q];
+          if (ch == kInfeasible) {
+            continue;
+          }
+          auto const tc = backward_ ? turn(tail_node, tail_port, q)
+                                    : turn(tail_node, q, tail_port);
+          if (tc == kInfeasible) {
+            continue;
+          }
+          auto const nc =
+              clamp_cost(static_cast<std::uint64_t>(ch) + tc + weight);
+          if (nc < max_ && nc < dst) {
+            dst = nc;
+          }
+        }
+      }
+    }
 
-    cch_close_loops(
-        std::span{cost_}.subspan(here.base_, here.ports_), here.ports_, max_,
-        backward_, c.loop_entries(rk),
-        [&](std::size_t const k) { return m.loop(c.loop_begin(rk) + k); },
-        [&](port_t const in, port_t const out) {
-          return turn(here.node_, in, out);
+    // Close the self loops at the node. A loop leaves the node and comes back
+    // to it on another port, which is how a turn that is forbidden here gets
+    // driven around, so it can still improve a port after the downward arcs
+    // have been pulled. Settling the ports cheapest first makes chains of loops
+    // converge in a single pass.
+    auto const loops = c.loop_entries(rk);
+    if (loops.empty()) {
+      return;
+    }
+    for_ports_by_cost(
+        ports, [&](port_t const p) { return cost_[base + p]; },
+        [&](port_t const at, cost_t const best) {
+          for (auto k = std::size_t{0U}; k != loops.size(); ++k) {
+            auto const entry = backward_ ? loops[k].exit_ : loops[k].entry_;
+            auto const exit = backward_ ? loops[k].entry_ : loops[k].exit_;
+            if (entry >= ports || exit >= ports) {
+              continue;
+            }
+            auto const weight = m.loop(c.loop_begin(rk) + k);
+            if (weight == kInfeasible) {
+              continue;
+            }
+            auto const tc =
+                backward_ ? turn(node, entry, at) : turn(node, at, entry);
+            if (tc == kInfeasible) {
+              continue;
+            }
+            auto const nc =
+                clamp_cost(static_cast<std::uint64_t>(best) + tc + weight);
+            if (nc < max_ && nc < cost_[base + exit]) {
+              cost_[base + exit] = nc;
+            }
+          }
         });
   }
 
-  cch_search<P> search_;
+  cch_search<P, /* WithPred */ false> search_;
 
   // Memo. `pos_` is rank indexed and holds the offset of a node's per port
   // block in `cost_`, or kNone. Only the entries in `touched_` are stale

@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <bit>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -19,6 +18,7 @@
 #include "utl/verify.h"
 
 #include "osr/routing/cch/order.h"
+#include "osr/routing/cch/parallel.h"
 
 namespace osr {
 
@@ -145,109 +145,6 @@ static_assert(sizeof(slot_head) == 8U);
 // (node, neighbor) pair rather than one per record.
 constexpr auto const kLockStripes = std::size_t{4096U};
 
-// Workers for the contraction, created once instead of per node.
-//
-// The parallel region is entered once per dense node, and a node's work is
-// far too small to pay for creating and joining threads every time: at 32
-// threads that overhead was large enough to make the contraction slower than
-// at 8. The workers therefore stay alive for the whole contraction and are
-// handed one node's targets at a time.
-struct worker_pool {
-  explicit worker_pool(unsigned const n) {
-    threads_.reserve(n);
-    for (auto i = 0U; i != n; ++i) {
-      threads_.emplace_back([this]() { loop(); });
-    }
-  }
-
-  worker_pool(worker_pool const&) = delete;
-  worker_pool& operator=(worker_pool const&) = delete;
-  worker_pool(worker_pool&&) = delete;
-  worker_pool& operator=(worker_pool&&) = delete;
-
-  ~worker_pool() {
-    {
-      auto const lock = std::lock_guard{m_};
-      stop_ = true;
-      ++generation_;
-    }
-    cv_.notify_all();
-    for (auto& t : threads_) {
-      t.join();
-    }
-  }
-
-  // Calls `job(i)` for every i < count and returns when all of them are done.
-  // The calling thread takes part, so the pool holds one worker less than the
-  // requested thread count -- the caller would only block otherwise.
-  template <typename Fn>
-  void run(std::size_t const count, Fn const& job) {
-    {
-      auto const lock = std::lock_guard{m_};
-      job_ = [](void const* ctx, std::size_t const i) {
-        (*static_cast<Fn const*>(ctx))(i);
-      };
-      job_ctx_ = &job;
-      count_ = count;
-      next_.store(0U, std::memory_order_relaxed);
-      pending_ = static_cast<unsigned>(threads_.size());
-      ++generation_;
-    }
-    cv_.notify_all();
-
-    work();
-
-    auto lock = std::unique_lock{m_};
-    done_cv_.wait(lock, [this]() { return pending_ == 0U; });
-  }
-
-private:
-  void work() {
-    for (auto i = next_.fetch_add(1U, std::memory_order_relaxed); i < count_;
-         i = next_.fetch_add(1U, std::memory_order_relaxed)) {
-      job_(job_ctx_, i);
-    }
-  }
-
-  void loop() {
-    auto seen = std::uint64_t{0U};
-    for (;;) {
-      {
-        auto lock = std::unique_lock{m_};
-        cv_.wait(lock, [&]() { return stop_ || generation_ != seen; });
-        seen = generation_;
-        if (stop_) {
-          return;
-        }
-      }
-
-      work();
-
-      {
-        auto const lock = std::lock_guard{m_};
-        if (--pending_ == 0U) {
-          done_cv_.notify_one();
-        }
-      }
-    }
-  }
-
-  std::mutex m_;
-  std::condition_variable cv_, done_cv_;
-  std::vector<std::thread> threads_;
-
-  // written under `m_` before the generation is bumped, read by the workers
-  // after they wake up, i.e. after they acquired `m_`
-  void (*job_)(void const*, std::size_t){nullptr};
-  void const* job_ctx_{nullptr};
-  std::size_t count_{0U};
-
-  std::atomic<std::size_t> next_{0U};
-  std::uint64_t generation_{0U};
-  unsigned pending_{0U};
-  bool stop_{false};
-};
-
 // Groups the ranks by their level in the elimination tree.
 //
 // The parent of a node is the lowest ranked of its upper neighbours in the
@@ -330,7 +227,7 @@ struct contractor {
         n_threads_{n_threads == 0U
                        ? std::max(1U, std::thread::hardware_concurrency())
                        : n_threads},
-        pool_{n_threads_ - 1U} {}
+        arena_{n_threads_} {}
 
   bool turn_ok(node_idx_t const n, port_t const in, port_t const out) const {
     return !is_restricted_for_all(r_, n, port_way_pos(in), port_way_pos(out));
@@ -733,49 +630,21 @@ struct contractor {
         .in_high(n);
 
     auto done = std::size_t{0U};
-    for (auto const& lvl : by_level) {
-      if (n_threads_ == 1U || lvl.size() == 1U) {
-        static thread_local auto s = node_scratch{};
-        for (auto const rank : lvl) {
+    for_each_level(
+        arena_, by_level, level_scratch_,
+        [&](node_scratch& s, cch_rank_t::value_t const rank) {
           prepare(rank, s);
-          for (auto k = std::size_t{0U}; k != s.neighbors_.size(); ++k) {
-            process_target(s, k);
-          }
-        }
-      } else if (lvl.size() > kLevelParallelCutoff) {
-        // wide level: one job per node, every worker reusing its scratch
-        pool_.run(lvl.size(), [&](std::size_t const i) {
-          static thread_local auto s = node_scratch{};
-          prepare(lvl[i], s);
-          for (auto k = std::size_t{0U}; k != s.neighbors_.size(); ++k) {
-            process_target(s, k);
-          }
+        },
+        [](node_scratch const& s, cch_rank_t::value_t) {
+          return std::pair{std::size_t{0U}, s.neighbors_.size()};
+        },
+        [&](node_scratch const& s, cch_rank_t::value_t, std::size_t const k) {
+          process_target(s, k);
+        },
+        [&](std::size_t const n_nodes) {
+          done += n_nodes;
+          pt->update_monotonic(done);
         });
-      } else {
-        // narrow level: group every node first, then one job per neighbor
-        if (level_scratch_.size() < lvl.size()) {
-          level_scratch_.resize(lvl.size());
-        }
-        pool_.run(lvl.size(), [&](std::size_t const i) {
-          prepare(lvl[i], level_scratch_[i]);
-        });
-
-        slot_jobs_.clear();
-        for (auto i = std::uint32_t{0U}; i != lvl.size(); ++i) {
-          for (auto k = std::uint32_t{0U};
-               k != level_scratch_[i].neighbors_.size(); ++k) {
-            slot_jobs_.emplace_back(i, k);
-          }
-        }
-        pool_.run(slot_jobs_.size(), [&](std::size_t const j) {
-          auto const [i, k] = slot_jobs_[j];
-          process_target(level_scratch_[i], k);
-        });
-      }
-
-      done += lvl.size();
-      pt->update_monotonic(done);
-    }
 
     write_csr();
   }
@@ -794,7 +663,7 @@ struct contractor {
 
     // The counts are already in place, `prepare` filled them in. The four
     // prefixes do not depend on each other, so they run as four jobs.
-    pool_.run(4U, [&](std::size_t const which) {
+    arena_.run(4U, [&](std::size_t const which) {
       switch (which) {
         case 0U:
           for (auto i = cch_rank_t::value_t{0U}; i != n; ++i) {
@@ -830,7 +699,7 @@ struct contractor {
     c_.up_ofs_[n_slots] = up_base_[n];
     c_.dn_ofs_[n_slots] = dn_base_[n];
 
-    pool_.run(n, [&](std::size_t const i) {
+    arena_.run(n, [&](std::size_t const i) {
       auto const rank = cch_rank_t{static_cast<cch_rank_t::value_t>(i)};
       auto const n_nb = c_.adj_ofs_[rank + 1U] - c_.adj_ofs_[rank];
       auto const* const heads =
@@ -894,7 +763,7 @@ struct contractor {
   ways::routing const& r_;
   cch& c_;
   unsigned n_threads_;
-  worker_pool pool_;
+  cch_arena arena_;
   std::vector<std::vector<arc_rec>> adj_;
   std::vector<std::vector<cch_entry>> loops_;
   std::vector<std::size_t> clean_size_;
@@ -907,7 +776,6 @@ struct contractor {
 
   // narrow levels: one scratch per node of the level, one job per neighbor
   std::vector<node_scratch> level_scratch_;
-  std::vector<std::pair<std::uint32_t, std::uint32_t>> slot_jobs_;
 };
 
 }  // namespace

@@ -193,15 +193,13 @@ void run(ways const& w,
   }
 }
 
-}  // namespace
-
-TEST(dijkstra_cch, monaco_fwd) {
-  auto const raw_data = "test/monaco.osm.pbf";
-  auto const data_dir = "test/monaco";
-  auto const num_samples = 10000U;
-  auto const max_cost = 2 * 3600U;
-  auto constexpr dir = direction::kForward;
-
+// Every case runs the same comparison against the same oracle; only the graph,
+// the sample count, the cost bound and the direction differ.
+void run_case(char const* raw_data,
+              char const* data_dir,
+              unsigned const num_samples,
+              unsigned const max_cost,
+              direction const dir) {
   if (!fs::exists(raw_data) && !fs::exists(data_dir)) {
     GTEST_SKIP() << raw_data << " not found";
   }
@@ -216,86 +214,43 @@ TEST(dijkstra_cch, monaco_fwd) {
   run(w, l, num_samples, max_cost, dir);
 }
 
-TEST(dijkstra_cch, DISABLED_monaco_bwd) {
-  auto const raw_data = "test/monaco.osm.pbf";
-  auto const data_dir = "test/monaco";
-  auto const num_samples = 10000U;
-  auto const max_cost = 2 * 3600U;
-  auto constexpr dir = direction::kBackward;
+}  // namespace
 
-  if (!fs::exists(raw_data) && !fs::exists(data_dir)) {
-    GTEST_SKIP() << raw_data << " not found";
-  }
-
-  load(raw_data, data_dir);
-  if (!cch::exists(data_dir)) {
-    GTEST_SKIP() << "no cch in " << data_dir;
-  }
-  auto const w = osr::ways{data_dir, cista::mmap::protection::READ};
-  auto const l = osr::lookup{w, data_dir, cista::mmap::protection::READ};
-
-  run(w, l, num_samples, max_cost, dir);
+// Forward only, deliberately. `route_cch` applies `dir` to the first and last
+// mile but the hierarchy search itself takes no direction and always walks the
+// forward graph, so a backward point to point query is not implemented --
+// `cch_supported` routes it to the Dijkstra instead. A backward case here would
+// therefore compare the Dijkstra against itself and pass without asserting
+// anything about the CCH, which is what the disabled case below did.
+TEST(dijkstra_cch, monaco_fwd) {
+  run_case("test/monaco.osm.pbf", "test/monaco", 10000U, 2 * 3600U,
+           direction::kForward);
 }
 
 TEST(dijkstra_cch, hamburg) {
-  auto const raw_data = "test/hamburg.osm.pbf";
-  auto const data_dir = "test/hamburg";
-  auto const num_samples = 5000U;
-  auto const max_cost = 3 * 3600U;
-  auto constexpr dir = direction::kForward;
-
-  if (!fs::exists(raw_data) && !fs::exists(data_dir)) {
-    GTEST_SKIP() << raw_data << " not found";
-  }
-
-  load(raw_data, data_dir);
-  if (!cch::exists(data_dir)) {
-    GTEST_SKIP() << "no cch in " << data_dir;
-  }
-  auto const w = osr::ways{data_dir, cista::mmap::protection::READ};
-  auto const l = osr::lookup{w, data_dir, cista::mmap::protection::READ};
-
-  run(w, l, num_samples, max_cost, dir);
+  run_case("test/hamburg.osm.pbf", "test/hamburg", 5000U, 3 * 3600U,
+           direction::kForward);
 }
 
 TEST(dijkstra_cch, switzerland) {
-  auto const raw_data = "test/switzerland.osm.pbf";
-  auto const data_dir = "test/switzerland";
-  auto const num_samples = 1000U;
-  auto const max_cost = 5 * 3600U;
-  auto constexpr dir = direction::kForward;
-
-  if (!fs::exists(raw_data) && !fs::exists(data_dir)) {
-    GTEST_SKIP() << raw_data << " not found";
-  }
-
-  load(raw_data, data_dir);
-  if (!cch::exists(data_dir)) {
-    GTEST_SKIP() << "no cch in " << data_dir;
-  }
-  auto const w = osr::ways{data_dir, cista::mmap::protection::READ};
-  auto const l = osr::lookup{w, data_dir, cista::mmap::protection::READ};
-
-  run(w, l, num_samples, max_cost, dir);
+  run_case("test/switzerland.osm.pbf", "test/switzerland", 1000U, 5 * 3600U,
+           direction::kForward);
 }
 
 TEST(dijkstra_cch, DISABLED_germany) {
-  auto const raw_data = "test/germany.osm.pbf";
-  auto const data_dir = "test/germany";
-  constexpr auto const num_samples = 50U;
-  constexpr auto const max_cost = 12 * 3600U;
-  auto constexpr dir = direction::kForward;
+  run_case("test/germany.osm.pbf", "test/germany", 50U, 12 * 3600U,
+           direction::kForward);
+}
 
-  if (!fs::exists(raw_data) && !fs::exists(data_dir)) {
-    GTEST_SKIP() << raw_data << " not found";
-  }
-
-  load(raw_data, data_dir);
-  if (!cch::exists(data_dir)) {
-    GTEST_SKIP() << "no cch in " << data_dir;
-  }
-  auto const w = osr::ways{data_dir, cista::mmap::protection::READ};
-  auto const l = osr::lookup{w, data_dir, cista::mmap::protection::READ};
-
-  run(w, l, num_samples, max_cost, dir);
+// Kept disabled, and not worth enabling. `cch_supported` sends a backward
+// point to point query to the Dijkstra, so both arms here are the same
+// algorithm and the case passes without asserting anything. Wiring `dir` into
+// `route_cch` would not change that verdict either: with no time dependence a
+// backward one to one query is the forward query with its endpoints swapped,
+// so it makes nothing computable that `monaco_fwd` does not already cover.
+// (One to many is a different matter -- there, backward is many to one, which
+// is a genuinely distinct query and is enabled.)
+TEST(dijkstra_cch, DISABLED_monaco_bwd) {
+  run_case("test/monaco.osm.pbf", "test/monaco", 10000U, 2 * 3600U,
+           direction::kBackward);
 }

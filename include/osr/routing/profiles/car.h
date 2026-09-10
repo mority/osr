@@ -23,6 +23,10 @@ template <bool IsBus>
 struct generic_car {
   static constexpr auto const kName = "car";
   static constexpr auto const kMaxMatchDistance = 200U;
+  // Which turn restriction set applies. `for_each_adjacent_node` takes this as
+  // a template argument rather than reading it off the profile, so a caller
+  // that does not go through it -- the CCH turn cost -- needs it exposed.
+  static constexpr auto const kIsBus = IsBus;
 
   using key = node_idx_t;
 

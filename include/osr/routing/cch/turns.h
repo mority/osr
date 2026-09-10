@@ -10,19 +10,6 @@
 
 namespace osr {
 
-// `for_each_adjacent_node` selects the turn restriction set with a template
-// parameter that is not part of the profile itself, so it has to be recovered
-// here.
-template <typename P>
-struct cch_profile_traits {
-  static constexpr auto const kIsBus = false;
-};
-
-template <>
-struct cch_profile_traits<generic_car<true>> {
-  static constexpr auto const kIsBus = true;
-};
-
 // Cost of the turn from the incoming port `in` to the outgoing port `out` at
 // node `n`, `kInfeasible` if the turn is forbidden. This is exactly what
 // `for_each_adjacent_node` adds on top of way cost and node cost, which is why
@@ -38,8 +25,7 @@ cost_t cch_turn_cost(typename P::parameters const& params,
   auto const from = port_way_pos(in);
   auto const to = port_way_pos(out);
 
-  if (is_profile_turn_restricted<P, direction::kForward,
-                                 cch_profile_traits<P>::kIsBus>(
+  if (is_profile_turn_restricted<P, direction::kForward, P::kIsBus>(
           params, r, timezones, n, from, to, std::nullopt, duration_t{0},
           direction::kForward)) {
     return kInfeasible;

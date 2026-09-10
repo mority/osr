@@ -7,16 +7,17 @@
 #include <atomic>
 #include <limits>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 #include "cista/memory_holder.h"
 #include "cista/reflection/for_each_field.h"
 
 #include "utl/helpers/algorithm.h"
-#include "utl/parallel_for.h"
 #include "utl/progress_tracker.h"
 
 #include "osr/routing/cch/cch.h"
+#include "osr/routing/cch/parallel.h"
 #include "osr/routing/cch/turns.h"
 #include "osr/routing/profile.h"
 #include "osr/types.h"
@@ -64,8 +65,6 @@ struct cch_metric {
   static constexpr auto const kWeightEscape =
       static_cast<weight_t>(kWeightInfeasible - 1U);
 
-  using exception_t = pair<cch_entry_idx_t, cost_t>;
-
   static std::filesystem::path file(std::filesystem::path const&);
   static bool exists(std::filesystem::path const&);
   static cista::wrapped<cch_metric> read(std::filesystem::path const&);
@@ -77,8 +76,14 @@ struct cch_metric {
            std::memcmp(params_.data(), params.data(), params.size()) == 0;
   }
 
+  // The side table is two parallel arrays -- the arc indices, sorted, and
+  // their costs -- rather than one array of pairs. A `pair<uint64, uint32>`
+  // carries four bytes of tail padding that nothing initializes and cista
+  // serializes verbatim, which made two customizations of the same graph
+  // produce metric files that differed byte for byte.
   static cost_t decode(vec64<weight_t> const& a,
-                       vec<exception_t> const& ex,
+                       vec<cch_entry_idx_t> const& x_idx,
+                       vec<cost_t> const& x_cost,
                        cch_entry_idx_t const i) {
     auto const v = a[i];
     if (v < kWeightEscape) {
@@ -87,27 +92,30 @@ struct cch_metric {
     if (v == kWeightInfeasible) {
       return kInfeasible;
     }
-    auto const it = std::lower_bound(
-        begin(ex), end(ex), i,
-        [](exception_t const& e, cch_entry_idx_t const k) {
-          return e.first < k;
-        });
-    return it->second;
+    auto const it = std::lower_bound(begin(x_idx), end(x_idx), i);
+    return x_cost[static_cast<std::uint32_t>(
+        std::distance(begin(x_idx), it))];
   }
 
-  cost_t up(cch_entry_idx_t const i) const { return decode(up_, up_x_, i); }
-  cost_t dn(cch_entry_idx_t const i) const { return decode(dn_, dn_x_, i); }
+  cost_t up(cch_entry_idx_t const i) const {
+    return decode(up_, up_xi_, up_xc_, i);
+  }
+  cost_t dn(cch_entry_idx_t const i) const {
+    return decode(dn_, dn_xi_, dn_xc_, i);
+  }
   cost_t loop(cch_entry_idx_t const i) const {
-    return decode(loop_, loop_x_, i);
+    return decode(loop_, loop_xi_, loop_xc_, i);
   }
 
   // Fills one of the arrays from the costs the customization computed.
   static void compress(std::vector<cost_t> const& src,
                        vec64<weight_t>& dst,
-                       vec<exception_t>& ex) {
+                       vec<cch_entry_idx_t>& x_idx,
+                       vec<cost_t>& x_cost) {
     dst.clear();
     dst.resize(static_cast<std::uint32_t>(src.size()));
-    ex.clear();
+    x_idx.clear();
+    x_cost.clear();
     for (auto i = std::size_t{0U}; i != src.size(); ++i) {
       auto const v = src[i];
       if (v == kInfeasible) {
@@ -116,22 +124,18 @@ struct cch_metric {
         dst[i] = static_cast<weight_t>(v);
       } else {
         dst[i] = kWeightEscape;
-        ex.emplace_back(exception_t{static_cast<cch_entry_idx_t>(i), v});
+        x_idx.emplace_back(static_cast<cch_entry_idx_t>(i));
+        x_cost.emplace_back(v);
       }
     }
   }
 
   vec64<weight_t> up_, dn_, loop_;
-  vec<exception_t> up_x_, dn_x_, loop_x_;
+  vec<cch_entry_idx_t> up_xi_, dn_xi_, loop_xi_;
+  vec<cost_t> up_xc_, dn_xc_, loop_xc_;
 
   // raw bytes of the profile parameters this metric was customized for
   vec<std::uint8_t> params_;
-
-  // diagnostics: how often a triangle could not be applied because the
-  // metric independent arc set does not contain the composed arc
-  std::uint64_t missing_slots_{0U};
-  std::uint64_t missing_entries_{0U};
-  std::uint64_t applied_{0U};
 };
 
 // Weight of the original edge `u --way--> v` for profile P: way cost plus the
@@ -321,6 +325,8 @@ void customize(typename P::parameters const& params,
                unsigned const n_threads = 0U) {
   auto const& r = *w.r_;
 
+  auto arena = cch_arena{n_threads};
+
   // The customization needs full precision while it composes triangles; the
   // result is compressed into the metric's 16 bit form at the end.
   auto w_up = std::vector<cost_t>(c.up_.size(), kInfeasible);
@@ -330,9 +336,6 @@ void customize(typename P::parameters const& params,
   m.params_.clear();
   m.params_.resize(static_cast<std::uint32_t>(blob.size()));
   std::memcpy(m.params_.data(), blob.data(), blob.size());
-  m.missing_slots_ = 0U;
-  m.missing_entries_ = 0U;
-  m.applied_ = 0U;
 
   auto const n = c.n_ranks();
 
@@ -342,9 +345,7 @@ void customize(typename P::parameters const& params,
   // Every entry is written by exactly one node -- the tail of the original
   // edge it belongs to -- so this phase needs no synchronization.
   // ---------------------------------------------------------------------
-  utl::parallel_for_run(
-      n,
-      [&](std::size_t const i) {
+  arena.run(n, [&](std::size_t const i) {
         auto const rank = cch_rank_t{static_cast<cch_rank_t::value_t>(i)};
         auto const u = c.order_[rank];
         for_each_edge(
@@ -371,9 +372,7 @@ void customize(typename P::parameters const& params,
                                                             : w_loop)[ref.idx_];
               weight = std::min(weight, cost);
             });
-      },
-      utl::noop_progress_update{}, utl::parallel_error_strategy::QUIT_EXEC,
-      n_threads);
+  });
 
   // ---------------------------------------------------------------------
   // 2. lower triangles
@@ -383,32 +382,12 @@ void customize(typename P::parameters const& params,
   // starts the next one, because a node only ever reads arcs of nodes on
   // smaller levels. Within a level the nodes run in parallel.
   // ---------------------------------------------------------------------
-  // Diagnostics are counted per job and folded in once when the job ends:
-  // `applied_` alone is incremented a billion times on a country sized graph,
-  // which no shared counter would survive.
-  struct counters {
-    std::uint64_t missing_slots_{0U};
-    std::uint64_t missing_entries_{0U};
-    std::uint64_t applied_{0U};
-  };
-
-  auto missing_slots = std::atomic<std::uint64_t>{0U};
-  auto missing_entries = std::atomic<std::uint64_t>{0U};
-  auto applied = std::atomic<std::uint64_t>{0U};
-
-  auto const fold = [&](counters const& cnt) {
-    missing_slots.fetch_add(cnt.missing_slots_, std::memory_order_relaxed);
-    missing_entries.fetch_add(cnt.missing_entries_,
-                              std::memory_order_relaxed);
-    applied.fetch_add(cnt.applied_, std::memory_order_relaxed);
-  };
-
   // The turn closure of a node is read only once it is built, so all slots of
   // a node can share it.
   auto const process_slots = [&](cch_rank_t const rank,
                                  cch_node_turns<P> const& turns,
                                  cch_slot_idx_t const from,
-                                 cch_slot_idx_t const to, counters& st) {
+                                 cch_slot_idx_t const to) {
     auto const s_begin = c.upper_begin(rank);
     auto const s_end = c.upper_end(rank);
 
@@ -456,9 +435,12 @@ void customize(typename P::parameters const& params,
               resolved = true;
               target = is_loop ? cch::kNoSlot
                                : (up ? c.find_slot(x, y) : c.find_slot(y, x));
-              if (!is_loop && target == cch::kNoSlot) {
-                ++st.missing_slots_;
-              } else {
+              // A feasible composition whose arc the hierarchy does not
+              // contain cannot happen: the contraction prunes a pair only
+              // when the turn is forbidden for every motorized profile, and
+              // then it is forbidden for this one too, so the composition
+              // would already have been rejected above.
+              if (is_loop || target != cch::kNoSlot) {
                 t_entries = is_loop ? c.loop_entries(x)
                                     : (up ? c.up_entries(target)
                                           : c.dn_entries(target));
@@ -477,10 +459,8 @@ void customize(typename P::parameters const& params,
             auto const idx = cch::find_entry(
                 t_entries, cch_entry{in[e1].entry_, out[e2].exit_});
             if (idx == kNoEntry) {
-              ++st.missing_entries_;
-              continue;
+              continue;  // cannot happen, see above
             }
-            ++st.applied_;
             cch_detail::relax_min(t_weights[idx], cost);
           }
           if (resolved && t_weights == nullptr) {
@@ -509,78 +489,37 @@ void customize(typename P::parameters const& params,
   auto const loop_weight = [&](cch_entry_idx_t const i) { return w_loop[i]; };
 
   auto turns = std::vector<cch_node_turns<P>>{};
-  auto slot_jobs = std::vector<std::pair<std::uint32_t, cch_slot_idx_t>>{};
 
-  for (auto const& lvl : by_level) {
-    // Most of the work sits in the few, very dense levels at the top: on
-    // Hamburg, levels with less than 64 nodes hold 83% of it. Those cannot be
-    // spread over their nodes, so they are spread over the (node, upper slot)
-    // pairs instead -- distinct slots of a node compose distinct arcs, so that
-    // is as race free as the split by node. It needs the turn closures of the
-    // whole level at once, which is why wide levels -- cheap, and there can be
-    // tens of thousands of them -- keep using the split by node.
-    if (lvl.size() > kLevelParallelCutoff) {
-      // wide level: one job per node, every worker reusing its turn closure
-      utl::parallel_for_run_threadlocal<cch_node_turns<P>>(
-          lvl.size(),
-          [&](cch_node_turns<P>& turns_of_worker, std::size_t const i) {
-            auto const rank = lvl[i];
-            turns_of_worker.reset(params, w, c, loop_weight, rank);
-            auto cnt = counters{};
-            process_slots(rank, turns_of_worker, c.upper_begin(rank),
-                          c.upper_end(rank), cnt);
-            fold(cnt);
-          },
-          utl::noop_progress_update{},
-          utl::parallel_error_strategy::QUIT_EXEC, n_threads);
-    } else {
-      // narrow level: build every turn closure first, then one job per slot
-      turns.resize(std::max(turns.size(), lvl.size()));
-      utl::parallel_for_run(
-          lvl.size(),
-          [&](std::size_t const i) {
-            turns[i].reset(params, w, c, loop_weight, lvl[i]);
-          },
-          utl::noop_progress_update{},
-          utl::parallel_error_strategy::QUIT_EXEC, n_threads);
-
-      slot_jobs.clear();
-      for (auto i = std::uint32_t{0U}; i != lvl.size(); ++i) {
-        for (auto s = c.upper_begin(lvl[i]); s != c.upper_end(lvl[i]); ++s) {
-          slot_jobs.emplace_back(i, s);
-        }
-      }
-      utl::parallel_for_run(
-          slot_jobs.size(),
-          [&](std::size_t const j) {
-            auto const [i, s] = slot_jobs[j];
-            auto cnt = counters{};
-            process_slots(lvl[i], turns[i], s, s + 1U, cnt);
-            fold(cnt);
-          },
-          utl::noop_progress_update{},
-          utl::parallel_error_strategy::QUIT_EXEC, n_threads);
-    }
-    done += lvl.size();
-    pt->update_monotonic(done);
-  }
+  for_each_level(
+      arena, by_level, turns,
+      [&](cch_node_turns<P>& t, cch_rank_t const rank) {
+        t.reset(params, w, c, loop_weight, rank);
+      },
+      [&](cch_node_turns<P> const&, cch_rank_t const rank) {
+        return std::pair{c.upper_begin(rank), c.upper_end(rank)};
+      },
+      [&](cch_node_turns<P> const& t, cch_rank_t const rank,
+          cch_slot_idx_t const s) {
+        process_slots(rank, t, s, s + 1U);
+      },
+      [&](std::size_t const n_nodes) {
+        done += n_nodes;
+        pt->update_monotonic(done);
+      });
 
   // Freed one at a time: holding all three full precision arrays and the
   // compressed output at once would raise the peak by the size of the result.
   auto const compress_and_free = [](std::vector<cost_t>& src,
                                     vec64<cch_metric::weight_t>& dst,
-                                    vec<cch_metric::exception_t>& ex) {
-    cch_metric::compress(src, dst, ex);
+                                    vec<cch_entry_idx_t>& x_idx,
+                                    vec<cost_t>& x_cost) {
+    cch_metric::compress(src, dst, x_idx, x_cost);
     src.clear();
     src.shrink_to_fit();
   };
-  compress_and_free(w_up, m.up_, m.up_x_);
-  compress_and_free(w_dn, m.dn_, m.dn_x_);
-  compress_and_free(w_loop, m.loop_, m.loop_x_);
-
-  m.missing_slots_ += missing_slots.load();
-  m.missing_entries_ += missing_entries.load();
-  m.applied_ += applied.load();
+  compress_and_free(w_up, m.up_, m.up_xi_, m.up_xc_);
+  compress_and_free(w_dn, m.dn_, m.dn_xi_, m.dn_xc_);
+  compress_and_free(w_loop, m.loop_, m.loop_xi_, m.loop_xc_);
 }
 
 }  // namespace osr

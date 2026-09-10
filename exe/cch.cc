@@ -78,8 +78,7 @@ int main(int ac, char const** av) {
     for (auto const x : m.dn_) {
       n_inf += (x == cch_metric::kWeightInfeasible ? 1U : 0U);
     }
-    fmt::println("customization: {} infeasible entries, {} triangles applied",
-                 n_inf, m.applied_);
+    fmt::println("customization: {} infeasible entries", n_inf);
     m.write(opt.data_);
     fmt::println("wrote {}", cch_metric::file(opt.data_));
   }

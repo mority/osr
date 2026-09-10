@@ -27,7 +27,6 @@
 #include "osr/routing/cch/customize.h"
 #include "osr/routing/cch/lazy_rphast.h"
 #include "osr/routing/cch/query.h"
-#include "osr/routing/cch/rphast.h"
 #include "osr/routing/cch/unpack.h"
 #include "osr/routing/dijkstra.h"
 #include "osr/routing/path_reconstruction.h"
@@ -905,6 +904,16 @@ path reconstruct_cch(typename P::parameters const& params,
 
   auto arcs = std::vector<arc>{};
 
+  // The search stores `arc_` relative to its slot resp. to the node's loop
+  // list, so the base is added back here, where the rank is still known.
+  auto const entry_idx = [&](cch_slot_idx_t const slot, cch_rank_t const rk,
+                             std::uint16_t const rel) -> cch_entry_idx_t {
+    return slot == cch::kLoopSlot ? c.loop_begin(rk) + rel : rel;
+  };
+  auto const bit_set = [](std::uint32_t const mask, port_t const p) {
+    return (mask & (std::uint32_t{1U} << p)) != 0U;
+  };
+
   auto rank = s.meet_rank_;
   auto port = s.meet_f_port_;
   while (true) {
@@ -913,8 +922,8 @@ path reconstruct_cch(typename P::parameters const& params,
     if (slot == cch::kNoSlot) {
       break;
     }
-    auto const up = e.up_[port] != 0U;
-    arcs.emplace_back(arc{slot, e.arc_[port], up});
+    auto const up = bit_set(e.up_, port);
+    arcs.emplace_back(arc{slot, entry_idx(slot, rank, e.arc_[port]), up});
     port = e.pred_port_[port];
     if (slot != cch::kLoopSlot) {
       rank = up ? c.tail(slot) : c.adj_head_[slot];
@@ -933,8 +942,9 @@ path reconstruct_cch(typename P::parameters const& params,
       auto const& e = s.b_.at(to_idx(rank));
       auto const slot = e.slot_[port];
       utl::verify(slot != cch::kNoSlot, "cch: broken backward chain");
-      arcs.emplace_back(arc{slot, e.arc_[port], false});
-      auto const done = e.seed_pred_[port] != 0U;
+      arcs.emplace_back(
+          arc{slot, entry_idx(slot, rank, e.arc_[port]), false});
+      auto const done = bit_set(e.seed_pred_, port);
       auto const pred_port = e.pred_port_[port];
       if (slot != cch::kLoopSlot) {
         rank = c.tail(slot);
@@ -1182,30 +1192,21 @@ std::optional<path> route_cch(typename P::parameters const& params,
   return std::nullopt;
 }
 
-// One-to-many over the CCH via RPHAST. The targets are selected once and the
-// upward search from the source runs once; a single sweep over the selected set
-// then yields the distance to every target at the same time.
+// One-to-many over the CCH via lazy RPHAST. The upward search from the source
+// runs once; each target then walks up the elimination tree until it meets a
+// node the memo already holds and computes the distances back down, so targets
+// share the upper region and a target that is never read costs nothing.
 //
 // Distances only: reconstruction is deliberately not done here. The caller
 // learns which targets matter (a station on an optimal journey) only afterwards
 // and re-routes point to point for those few, rather than paying to unpack
 // hundreds of paths that will be discarded.
-namespace {
-
-bool lazy_rphast_enabled() {
-  static auto const on = std::getenv("OSR_LAZY_RPHAST") != nullptr;
-  return on;
-}
-
-}  // namespace
-
 template <Profile P>
 std::vector<std::optional<path>> route_rphast(
     typename P::parameters const& params,
     ways const& w,
     cch const& c,
     cch_metric const& m,
-    rphast<P>& rp,
     lazy_rphast<P>& lz,
     location const& from,
     std::vector<location> const& to,
@@ -1220,50 +1221,8 @@ std::vector<std::optional<path>> route_rphast(
   }
 
   auto const& r = *w.r_;
-  auto const lazy = lazy_rphast_enabled();
   auto const backward = dir == direction::kBackward;
-  if (lazy) {
-    lz.clear();
-  } else {
-    rp.clear();
-  }
-
-  // Selection only needs the set of target nodes, so it is done once over all
-  // candidates of all targets and stays valid for every source afterwards.
-  // Lazy RPHAST has no selection phase, and this loop has no other effect, so
-  // it is skipped entirely -- not paying for it is part of the point.
-  for (auto k = std::size_t{0U}; !lazy && k != to_match.size(); ++k) {
-    auto const tm = to_match[match_idx_t{static_cast<match_idx_t::value_t>(k)}];
-    for (auto j = std::size_t{0U}; j != tm.size(); ++j) {
-      auto const dest_way = tm.way_[j];
-      auto const dest_left = tm.left(j);
-      auto const dest_right = tm.right(j);
-      for (auto const* x : {&dest_left, &dest_right}) {
-        if (!x->valid()) {
-          continue;
-        }
-        auto const way_dir = flip(opposite(dir), x->way_dir_);
-        auto const dc = P::way_cost(
-            params, r, w.timezones_, dest_way, r.way_properties_[dest_way],
-            way_dir, static_cast<distance_t>(x->dist_to_node_), std::nullopt,
-            duration_t{0}, dir);
-        if (dc.cost_ == kInfeasible || dc.cost_ >= max) {
-          continue;
-        }
-        P::resolve_all(r, x->node_, to[k].lvl_, [&](auto const node) {
-          if (!P::is_dest_reachable(params, r, w.timezones_, node, dest_way,
-                                    way_dir, dir, std::nullopt,
-                                    duration_t{0})) {
-            return;
-          }
-          rp.add_target(c, node.n_);
-        });
-      }
-    }
-  }
-  if (!lazy) {
-    rp.select(r, c, /* pack */ false, backward);
-  }
+  lz.clear();
 
   auto const distance_lng_degrees = geo::approx_distance_lng_degrees(from.pos_);
   auto found = std::size_t{0U};
@@ -1297,22 +1256,17 @@ std::vector<std::optional<path>> route_rphast(
       }
       P::resolve_start_node(
           r, start_way, nc->node_, from.lvl_, dir, [&](auto const node) {
-            auto const p = make_port(node.way_, node.dir_);
-            if (lazy) {
-              lz.add_start(c, node.n_, p, sc.cost_);
-            } else {
-              rp.add_start(c, node.n_, p, sc.cost_);
-            }
+            lz.add_start(c, node.n_, make_port(node.way_, node.dir_),
+                         sc.cost_);
           });
     }
-    if (lazy ? lz.no_starts() : rp.no_starts()) {
+    if (lz.no_starts()) {
       continue;
     }
 
     auto const bound = std::max(kMinCostSettled, max);
-    should_continue = (lazy ? lz.run(params, w, c, m, bound, backward)
-                            : rp.run(params, w, c, m, bound)) &&
-                      should_continue;
+    should_continue =
+        lz.run(params, w, c, m, bound, backward) && should_continue;
 
     auto const start_component = r.way_component_[start_way];
 
@@ -1384,8 +1338,7 @@ std::vector<std::optional<path>> route_rphast(
               return;
             }
             auto const tp = make_port(node.way_, node.dir_);
-            auto const d = lazy ? lz.get(params, w, c, m, node.n_, tp)
-                                : rp.get(c, node.n_, tp);
+            auto const d = lz.get(params, w, c, m, node.n_, tp);
             if (d == kInfeasible) {
               return;
             }
@@ -1704,7 +1657,6 @@ std::vector<std::optional<path>> route(
                 w.p_, profile, blob,
                 [&](cch_metric& out) { customize<P>(pp, w, *c, out); });
             return route_rphast<P>(pp, w, *c, *m,
-                                   thread_local_search<rphast<P>>(),
                                    thread_local_search<lazy_rphast<P>>(), from,
                                    to, from_match,
                                    to_match, max, dir);
@@ -1723,12 +1675,14 @@ std::vector<std::optional<path>> route(
 
 namespace {
 
+// What both entry points require. The direction is deliberately not among
+// them: the one to many query implements the reversed search and the point to
+// point one does not, so each call site states its own constraint.
 bool cch_supported(search_profile const p,
-                   direction const dir,
                    std::optional<routing_time_t> const& start_time,
                    bitvec<node_idx_t> const* blocked,
                    sharing_data const* sharing) {
-  return dir == direction::kForward && !start_time.has_value() &&
+  return !start_time.has_value() &&
          blocked == nullptr && sharing == nullptr &&
          (p == search_profile::kCar || p == search_profile::kBus ||
           p == search_profile::kHgv);
@@ -1813,8 +1767,11 @@ std::optional<path> route(profile_parameters const& params,
       profile == search_profile::kCarSharing) {
     algo = routing_algorithm::kDijkstra;  // TODO
   }
+  // Either direction: `route_rphast` seeds the reversed search for
+  // `kBackward`, which lazy RPHAST implements end to end -- it relaxes `up_`
+  // arcs upward instead of `dn_` and swaps the two port roles at every turn.
   if (algo == routing_algorithm::kCCH &&
-      (!cch_supported(profile, dir, start_time, blocked, sharing) ||
+      (!cch_supported(profile, start_time, blocked, sharing) ||
        get_cch_registry().get(w.p_) == nullptr)) {
     algo = routing_algorithm::kDijkstra;
   } else if (profile == search_profile::kHgv &&
@@ -1881,8 +1838,12 @@ std::optional<path> route(profile_parameters const& params,
       profile == search_profile::kCarParking) {
     algo = routing_algorithm::kDijkstra;  // TODO
   }
+  // Forward only: `route_cch` applies `dir` to the first and the last mile,
+  // but the hierarchy search itself always walks the forward graph, so a
+  // backward query would charge a reversed last mile onto a forward path.
   if (algo == routing_algorithm::kCCH &&
-      (!cch_supported(profile, dir, start_time, blocked, sharing) ||
+      (dir != direction::kForward ||
+       !cch_supported(profile, start_time, blocked, sharing) ||
        get_cch_registry().get(w.p_) == nullptr)) {
     algo = routing_algorithm::kDijkstra;
   } else if (profile == search_profile::kHgv &&

@@ -29,7 +29,12 @@ struct cch_path_edge {
 // with (forward search) resp. which original edge we will leave the node with
 // (backward search). Turn costs and turn restrictions are evaluated whenever
 // two arcs meet at a node, which keeps them out of the stored graph.
-template <WayAwareProfile P>
+// `WithPred` says whether a state also records where it was reached from.
+// Only a point to point query reconstructs a path; the one to many searches
+// read costs and nothing else. The predecessor block is the larger part of a
+// state and is paid for every node the search touches, so it is left out
+// entirely rather than filled and ignored.
+template <WayAwareProfile P, bool WithPred = true>
 struct cch_search {
   using node = typename P::node;
 
@@ -43,19 +48,33 @@ struct cch_search {
     cost_t operator()(label const& l) const noexcept { return l.cost_; }
   };
 
-  struct entry {
+  // How a state was reached. `arc_` is the index of the entry *within* its
+  // slot's list, resp. within the node's loop list -- both bounded by
+  // `kMaxPorts * kMaxPorts` -- and not an absolute entry index, which would
+  // need the full 64 bits for a planet sized hierarchy. The reconstruction
+  // knows the slot and the rank at that point and can add the base back.
+  struct pred_block {
+    std::array<cch_slot_idx_t, kMaxPorts> slot_;
+    std::array<std::uint16_t, kMaxPorts> arc_;
+    std::array<port_t, kMaxPorts> pred_port_{};
+    std::uint32_t up_{};  // one bit per port
+    // predecessor is a target state, i.e. the chain ends here (bit per port)
+    std::uint32_t seed_pred_{};
+  };
+  static_assert(kMaxPorts * kMaxPorts <=
+                std::numeric_limits<std::uint16_t>::max());
+
+  struct no_pred {};
+
+  struct entry : std::conditional_t<WithPred, pred_block, no_pred> {
     entry() {
       cost_.fill(kInfeasible);
-      slot_.fill(cch::kNoSlot);
+      if constexpr (WithPred) {
+        this->slot_.fill(cch::kNoSlot);
+      }
     }
 
     std::array<cost_t, kMaxPorts> cost_;
-    std::array<cch_slot_idx_t, kMaxPorts> slot_;
-    std::array<cch_entry_idx_t, kMaxPorts> arc_;
-    std::array<port_t, kMaxPorts> pred_port_{};
-    std::array<std::uint8_t, kMaxPorts> up_{};
-    // predecessor is a target state, i.e. the chain ends here
-    std::array<std::uint8_t, kMaxPorts> seed_pred_{};
   };
 
   struct terminal {
@@ -107,17 +126,7 @@ struct cch_search {
     }
   }
 
-  bool empty() const { return starts_.empty() || targets_.empty(); }
-
   bool no_starts() const { return starts_.empty(); }
-
-  void clear_starts() { starts_.clear(); }
-
-  // Stall-on-demand: a state that can be reached cheaper via a higher ranked
-  // node cannot be on an up-down path, so it does not have to be expanded.
-  // Measured on Hamburg it only prunes ~8% of the settled states while the
-  // check itself costs more than that, so it is off by default.
-  static constexpr auto const kStallOnDemand = false;
 
   // Common setup of the three entry points. The bucket counts stay with the
   // caller: a one directional run only fills one of the two queues, and sizing
@@ -138,7 +147,8 @@ struct cch_search {
   void seed_starts(map_t& map, dial<label, get_bucket>& pq) {
     for (auto const& s : starts_) {
       if (s.cost_ < max_) {
-        relax(map, pq, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, 0U, 0U);
+        relax(map, pq, s.rank_, s.port_, s.cost_, cch::kNoSlot, 0U, false,
+              0U);
       }
     }
   }
@@ -198,49 +208,47 @@ struct cch_search {
     return !max_reached_;
   }
 
-  // Forward-only upward search from the starts, run to exhaustion within the
-  // cost bound. RPHAST needs the complete upward search space of the source:
-  // there is no opposite search to meet, so the bidirectional termination
-  // criterion does not apply and `best_` stays infeasible throughout. Targets
-  // are not set up at all -- the scanning phase handles the downward half.
-  bool run_forward(typename P::parameters const& params,
-                   ways const& w,
-                   cch const& c,
-                   cch_metric const& m,
-                   cost_t const max) {
+  // One directional upward search from the starts, run to exhaustion within
+  // the cost bound. RPHAST needs the complete upward search space of the
+  // source: there is no opposite search to meet, so the bidirectional
+  // termination criterion does not apply and `best_` stays infeasible
+  // throughout. Targets are not set up at all -- the scanning phase handles the
+  // downward half.
+  //
+  // `Forward == false` mirrors it into the reversed graph, which is what a last
+  // mile query needs: the *backward* states are seeded from the starts and
+  // `dn_` arcs are relaxed upward, which is the upward search of the reversed
+  // graph. A state (node, port) then carries the cost from that node, leaving
+  // by that port, to the seeded location.
+  template <bool Forward>
+  bool run_upward(typename P::parameters const& params,
+                  ways const& w,
+                  cch const& c,
+                  cch_metric const& m,
+                  cost_t const max) {
     reset(max);
-    pq_f_.n_buckets(max);
+
+    auto& pq = Forward ? pq_f_ : pq_b_;
+    pq.n_buckets(max);
 
     auto const turn = cch_turn_fn<P>(params, w);
-    seed_starts(f_, pq_f_);
+    seed_starts(Forward ? f_ : b_, pq);
 
-    while (!pq_f_.empty()) {
-      step<true>(*w.r_, c, m, turn);
+    while (!pq.empty()) {
+      step<Forward>(*w.r_, c, m, turn);
     }
 
     return !max_reached_;
   }
 
-  // Mirror of `run_forward` for reverse queries: seeds the *backward* states
-  // from the starts and relaxes `dn_` arcs upward, which is the upward search
-  // of the reversed graph. A state (node, port) here carries the cost from that
-  // node, leaving by that port, to the seeded location.
-  bool run_backward(typename P::parameters const& params,
-                    ways const& w,
-                    cch const& c,
-                    cch_metric const& m,
-                    cost_t const max) {
-    reset(max);
-    pq_b_.n_buckets(max);
-
-    auto const turn = cch_turn_fn<P>(params, w);
-    seed_starts(b_, pq_b_);
-
-    while (!pq_b_.empty()) {
-      step<false>(*w.r_, c, m, turn);
-    }
-
-    return !max_reached_;
+  bool run_upward(typename P::parameters const& params,
+                  ways const& w,
+                  cch const& c,
+                  cch_metric const& m,
+                  cost_t const max,
+                  bool const backward) {
+    return backward ? run_upward<false>(params, w, c, m, max)
+                    : run_upward<true>(params, w, c, m, max);
   }
 
   // Per port costs of the forward search space, keyed by rank.
@@ -260,10 +268,10 @@ struct cch_search {
              port_t const p,
              cost_t const cost,
              cch_slot_idx_t const slot,
-             cch_entry_idx_t const arc,
-             std::uint8_t const up,
+             std::uint16_t const arc,
+             bool const up,
              port_t const pred_port,
-             std::uint8_t const seed_pred = 0U) {
+             bool const seed_pred = false) {
     if (cost >= max_) {
       max_reached_ = true;
       return;
@@ -271,11 +279,14 @@ struct cch_search {
     auto& e = map[to_idx(rank)];
     if (cost < e.cost_[p]) {
       e.cost_[p] = cost;
-      e.slot_[p] = slot;
-      e.arc_[p] = arc;
-      e.up_[p] = up;
-      e.pred_port_[p] = pred_port;
-      e.seed_pred_[p] = seed_pred;
+      if constexpr (WithPred) {
+        auto const bit = std::uint32_t{1U} << p;
+        e.slot_[p] = slot;
+        e.arc_[p] = arc;
+        e.pred_port_[p] = pred_port;
+        e.up_ = up ? (e.up_ | bit) : (e.up_ & ~bit);
+        e.seed_pred_ = seed_pred ? (e.seed_pred_ | bit) : (e.seed_pred_ & ~bit);
+      }
       pq.push(label{cost, rank, p});
     }
   }
@@ -347,56 +358,9 @@ struct cch_search {
         }
         relax(b_, pq_b_, h, entries[k].entry_,
               clamp_cost(static_cast<std::uint64_t>(cost) + weight), s,
-              static_cast<cch_entry_idx_t>(k), 0U, p, 1U);
+              static_cast<std::uint16_t>(k), false, p, true);
       }
     }
-  }
-
-  // Is there a cheaper way to this state coming down from a higher ranked
-  // node? Then it is not part of any up-down path and can be skipped.
-  template <bool Forward, typename TurnFn>
-  bool stalled(ways::routing const& r,
-               cch const& c,
-               cch_metric const& m,
-               map_t const& map,
-               label const& l,
-               TurnFn const& turn) const {
-    for (auto s = c.upper_begin(l.rank_); s != c.upper_end(l.rank_); ++s) {
-      auto const h = c.adj_head_[s];
-      auto const it = map.find(to_idx(h));
-      if (it == end(map)) {
-        continue;
-      }
-      // forward: arcs h -> this node, backward: arcs this node -> h
-      auto const entries = Forward ? c.dn_entries(s) : c.up_entries(s);
-      auto const ofs = Forward ? c.dn_ofs_[s] : c.up_ofs_[s];
-      auto const h_ports = n_capped_ports(r, c.order_[h]);
-      for (auto k = std::size_t{0U}; k != entries.size(); ++k) {
-        if ((Forward ? entries[k].exit_ : entries[k].entry_) != l.port_) {
-          continue;
-        }
-        auto const weight = (Forward ? m.dn(ofs + k) : m.up(ofs + k));
-        if (weight == kInfeasible || weight >= l.cost_) {
-          continue;
-        }
-        for (auto p = port_t{0U}; p != h_ports; ++p) {
-          auto const c2 = it->second.cost_[p];
-          if (c2 == kInfeasible || c2 + weight >= l.cost_) {
-            continue;
-          }
-          auto const tc = Forward ? turn(c.order_[h], p, entries[k].entry_)
-                                  : turn(c.order_[h], entries[k].exit_, p);
-          if (tc == kInfeasible) {
-            continue;
-          }
-          if (clamp_cost(static_cast<std::uint64_t>(c2) + tc + weight) <
-              l.cost_) {
-            return true;
-          }
-        }
-      }
-    }
-    return false;
   }
 
   template <bool Forward, typename TurnFn>
@@ -416,12 +380,6 @@ struct cch_search {
     ++n_settled_;
 
     auto const n = c.order_[l.rank_];
-
-    if constexpr (kStallOnDemand) {
-      if (stalled<Forward>(r, c, m, map, l, turn)) {
-        return;
-      }
-    }
 
     // meeting with the opposite search
     if (auto const it = other.find(to_idx(l.rank_)); it != end(other)) {
@@ -483,8 +441,7 @@ struct cch_search {
         relax(map, pq, l.rank_,
               Forward ? loops[k].exit_ : loops[k].entry_,
               clamp_cost(static_cast<std::uint64_t>(l.cost_) + tc + weight),
-              cch::kLoopSlot, idx, Forward ? std::uint8_t{1U} : std::uint8_t{0U},
-              l.port_);
+              cch::kLoopSlot, static_cast<std::uint16_t>(k), Forward, l.port_);
       }
     }
 
@@ -504,8 +461,7 @@ struct cch_search {
         }
         relax(map, pq, h, Forward ? entries[k].exit_ : entries[k].entry_,
               clamp_cost(static_cast<std::uint64_t>(l.cost_) + tc + weight), s,
-              static_cast<cch_entry_idx_t>(k),
-              Forward ? std::uint8_t{1U} : std::uint8_t{0U}, l.port_);
+              static_cast<std::uint16_t>(k), Forward, l.port_);
       }
     }
   }

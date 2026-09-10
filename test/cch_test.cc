@@ -318,10 +318,8 @@ void report(ways const& w, cch const& c, cch_metric const& m) {
     n_inf += (x == kInfeasible ? 1U : 0U);
   }
   fmt::println(
-      "cch: {} nodes, {} slots, {} up entries, {} dn entries, {} infeasible, "
-      "{} triangles applied, {} missing slots, {} missing entries",
-      c.n_ranks(), c.n_slots(), c.up_.size(), c.dn_.size(), n_inf, m.applied_,
-      m.missing_slots_, m.missing_entries_);
+      "cch: {} nodes, {} slots, {} up entries, {} dn entries, {} infeasible",
+      c.n_ranks(), c.n_slots(), c.up_.size(), c.dn_.size(), n_inf);
 }
 
 void run_core(std::string_view raw_data,
