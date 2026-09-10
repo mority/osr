@@ -447,31 +447,13 @@ area_geodesics::area_geodesics(
     std::abort();
   }
   auto keep = std::vector<char>(pts.size(), 0);
-  auto const check = [&](std::size_t const i, char const* where) {
-    if (i >= keep.size()) {
-      std::fprintf(stderr, "area_geodesics: %s index %zu >= %zu\n", where, i,
-                   keep.size());
-      std::abort();
-    }
-  };
   for (auto const v : connector_vertex_) {
     if (v != kNoVertex) {
-      check(v, "connector");
       keep[v] = 1;
     }
   }
-  if (ring_vertices.size() != poly.rings_.size()) {
-    std::fprintf(stderr, "area_geodesics: %zu ring_vertices vs %zu rings\n",
-                 ring_vertices.size(), poly.rings_.size());
-    std::abort();
-  }
   for (auto const [ring_i, rv] : utl::enumerate(ring_vertices)) {
     auto const& ring = poly.rings_[ring_i];
-    if (ring.size() != rv.size()) {
-      std::fprintf(stderr, "area_geodesics: ring %zu size %zu vs rv %zu\n",
-                   ring_i, ring.size(), rv.size());
-      std::abort();
-    }
     auto const area = signed_area(ring);
     auto const s = (ring_i == 0U ? (area >= 0.0) : (area <= 0.0)) ? 1.0 : -1.0;
     for (auto i = std::size_t{0U}; i != rv.size(); ++i) {
@@ -481,7 +463,6 @@ area_geodesics::area_geodesics(
       auto const cross =
           (v.x_ - u.x_) * (w.y_ - v.y_) - (v.y_ - u.y_) * (w.x_ - v.x_);
       if (s * cross < 0.0) {
-        check(rv[i], "reflex");
         keep[rv[i]] = 1;
       }
     }
@@ -489,7 +470,6 @@ area_geodesics::area_geodesics(
   // Barrier corners are hole corners, so they are reflex by construction and
   // are what a path bends at to get round a fence.
   for (auto const v : obstacle_vertices) {
-    check(v, "obstacle");
     keep[v] = 1;
   }
 
@@ -589,6 +569,9 @@ float area_geodesics::distance(std::size_t const i, std::size_t const j) const {
 }
 
 bool area_geodesics::is_connector_reachable(std::size_t const i) const {
+  if (i >= n_connectors_) {
+    return false;
+  }
   for (auto j = std::size_t{0U}; j != n_connectors_; ++j) {
     if (i != j && distance(i, j) != kUnreachable) {
       return true;

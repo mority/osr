@@ -143,6 +143,11 @@ constexpr auto kMaxTriangulationVertices = std::size_t{110U};
 // Adaptive subdivision needs headroom beyond the fixed-depth experiments.
 constexpr auto kAdaptiveMaxDepth = std::size_t{6U};
 
+// The fit alternates between deriving routes and refitting costs. It has
+// converged by four rounds - sixteen produces identical output to the decimal
+// on Berlin - so this is not a knob worth turning.
+constexpr auto kFitIterations = 4;
+
 // How many portals a single cell border may carry. One portal is the
 // assumption the whole flat-cost framework was built on; it is only neutral
 // for routes already inside the same pair of cells.
@@ -1305,7 +1310,20 @@ void check_portals(cell_tree const& c, osr::area_geodesics const& g, bool& ok) {
   if (c.leaf()) {
     return;
   }
-  ok = ok && g.is_connector_reachable(c.portal_);
+  // A cut carries EITHER a list of portals (split_orthogonal) or a single one
+  // (split_smart) or none at all (split_geodesic shares its endpoints through
+  // the children's own connector lists). Reading portal_ unconditionally means
+  // reading its SIZE_MAX sentinel for the first and last of those.
+  auto const check = [&](std::size_t const p) {
+    ok = ok && p < g.n_connectors() && g.is_connector_reachable(p);
+  };
+  if (!c.portals_.empty()) {
+    for (auto const p : c.portals_) {
+      check(p);
+    }
+  } else if (c.portal_ != std::numeric_limits<std::size_t>::max()) {
+    check(c.portal_);
+  }
   check_portals(*c.lhs_, g, ok);
   check_portals(*c.rhs_, g, ok);
 }
@@ -1496,6 +1514,12 @@ composition_result evaluate_composition(
     auto hi = 0.0;
     for (auto i = std::size_t{0U}; i != pts.size(); ++i) {
       for (auto j = i + 1U; j != pts.size(); ++j) {
+        // A portal is a token, not a place: it exists to make two cells
+        // neighbours, and has no distance to anything. Only real connectors
+        // seed the cost, and the global fit adjusts from there.
+        if (pts[i] >= g.n_connectors() || pts[j] >= g.n_connectors()) {
+          continue;
+        }
         auto const d = g.distance(pts[i], pts[j]);
         if (d == osr::area_geodesics::kUnreachable) {
           return {};
@@ -1504,10 +1528,12 @@ composition_result evaluate_composition(
         hi = std::max<double>(hi, d);
       }
     }
-    if (lo == inf) {
-      continue;
-    }
-    auto const c = 0.5 * (lo + hi);
+    // A cell may have no connector pair of its own to seed from - one real
+    // connector plus portals is enough to be a cell, and portals are tokens
+    // with no distances. Its hub still has to exist and be connected, or the
+    // cell drops out of the graph entirely and nothing can route through it.
+    // The fit sets its cost from the routes that pass through it.
+    auto const c = lo == inf ? 0.0 : 0.5 * (lo + hi);
     result.cell_errors_.push_back(0.5 * (hi - lo));
     auto const hub = n_points + ci;
     for (auto const p : pts) {
@@ -1530,7 +1556,7 @@ composition_result evaluate_composition(
       cost[ci] = adj[hub].empty() ? 0.0 : 2.0 * adj[hub].front().second;
     }
 
-    for (auto iter = 0; iter != 4; ++iter) {
+    for (auto iter = 0; iter != kFitIterations; ++iter) {
       // Which cells each pair's modelled route crosses, under current costs.
       auto rows = std::vector<std::pair<std::vector<std::size_t>, double>>{};
       for (auto src = std::size_t{0U}; src != n_connectors; ++src) {
@@ -2544,20 +2570,25 @@ int main(int argc, char** argv) {
           // experiences, rather than a per-cell statistic that the fit has
           // already been shown not to depend on.
           {
+            // Portals as tokens: no positions, so no second oracle run, no
+            // fallback for one landing outside the polygon, and nothing to
+            // check. `g` - built from the connectors alone - is reused.
             auto portals_f = std::vector<geo::latlng>{};
             auto root_f = cell_tree{};
             root_f.connectors_ = root.connectors_;
             split_smart(root_f, connectors, rings, portals_f, kAdaptiveMaxDepth,
                         g, relevant, n_c, 0.0);
-            auto pts_f = connectors;
-            pts_f.insert(end(pts_f), begin(portals_f), end(portals_f));
-            if (!portals_f.empty() &&
-                n_vertices + pts_f.size() <= kMaxVertices) {
-              auto const gf = osr::area_geodesics{rings, pts_f, barriers};
-              resolve_portals(root_f, gf);
-              auto ok_f = true;
-              check_portals(root_f, gf, ok_f);
-              if (ok_f) {
+            auto const n_tokens = connectors.size() + portals_f.size();
+            if (!portals_f.empty()) {
+              // Portals keep their positions - collect_cells needs them to
+              // decide which leaf on each side a border belongs to, which is
+              // the topology itself. They are NOT added to the oracle: their
+              // distances are never read, so `g` (connectors only) is reused
+              // and the second area_geodesics build per strategy disappears.
+              auto const& gf = g;
+              auto pts_f = connectors;
+              pts_f.insert(end(pts_f), begin(portals_f), end(portals_f));
+              {
                 for (auto const t : {10.0, 20.0, 40.0}) {
                   reset_expanded(root_f);
                   auto cells_f = std::vector<std::vector<std::size_t>>{};
