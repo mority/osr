@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Layer 4 of area routing, end to end (area_graph_test.cc). A plaza with two
+  entrances, A (2) and B (5), about 100 m apart. The only mapped way between
+  them goes round the plaza: A - N1 - N2 - B, about 400 m. A stub at each end
+  (D - A, B - E) makes A and B routing nodes.
+
+      N1 ========== N2
+      |              |
+      |    plaza     |
+      |              |
+  D - A              B - E
+-->
+<osm version="0.6" generator="osr-test">
+  <node id="1" lat="49.000000" lon="7.999863"/>
+  <node id="2" lat="49.000000" lon="8.000000"/>
+  <node id="3" lat="49.001350" lon="8.000000"/>
+  <node id="4" lat="49.001350" lon="8.001370"/>
+  <node id="5" lat="49.000000" lon="8.001370"/>
+  <node id="6" lat="49.000000" lon="8.001507"/>
+
+  <way id="1001">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="1002">
+    <nd ref="2"/>
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <nd ref="5"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="1003">
+    <nd ref="5"/>
+    <nd ref="6"/>
+    <tag k="highway" v="footway"/>
+  </way>
+</osm>

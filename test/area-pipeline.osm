@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Layers 0 to 3 of area routing over OSM data (area_pipeline_test.cc).
+
+  Plaza A (way 2001): entered only at opposite corners A1 (101) and A3 (103),
+  with a building in it (way 2104), stairs coming up in the middle with no
+  way leading to their end (way 2103, end node 12), a small entrance area
+  overlapping its east edge (way 2105), and a bare place=square over all of
+  it (way 2106).
+
+  Plaza B (way 3001): entered at opposite corners B1 (201) and B3 (203), with
+  a footway mapped straight across between them (way 3103).
+
+  osmium wants nodes before ways, each sorted by id.
+-->
+<osm version="0.6" generator="osr-test">
+  <node id="10" lat="49.000000" lon="7.999500"/>
+  <node id="11" lat="49.001000" lon="8.001100"/>
+  <node id="12" lat="49.000350" lon="8.000600"/>
+  <node id="13" lat="49.000350" lon="7.999000"/>
+  <node id="20" lat="49.000000" lon="8.009500"/>
+  <node id="21" lat="49.001000" lon="8.011100"/>
+
+  <!-- plaza A -->
+  <node id="101" lat="49.000000" lon="8.000000"/>
+  <node id="102" lat="49.000000" lon="8.001100"/>
+  <node id="103" lat="49.000700" lon="8.001100"/>
+  <node id="104" lat="49.000700" lon="8.000000"/>
+  <!-- building -->
+  <node id="111" lat="49.000300" lon="8.000300"/>
+  <node id="112" lat="49.000300" lon="8.000500"/>
+  <node id="113" lat="49.000500" lon="8.000500"/>
+  <node id="114" lat="49.000500" lon="8.000300"/>
+  <!-- entrance area -->
+  <node id="121" lat="49.000300" lon="8.001000"/>
+  <node id="122" lat="49.000300" lon="8.001300"/>
+  <node id="123" lat="49.000400" lon="8.001300"/>
+  <node id="124" lat="49.000400" lon="8.001000"/>
+  <!-- square -->
+  <node id="131" lat="48.999900" lon="7.999900"/>
+  <node id="132" lat="48.999900" lon="8.001200"/>
+  <node id="133" lat="49.000800" lon="8.001200"/>
+  <node id="134" lat="49.000800" lon="7.999900"/>
+
+  <!-- plaza B -->
+  <node id="201" lat="49.000000" lon="8.010000"/>
+  <node id="202" lat="49.000000" lon="8.011100"/>
+  <node id="203" lat="49.000700" lon="8.011100"/>
+  <node id="204" lat="49.000700" lon="8.010000"/>
+
+  <way id="2001">
+    <nd ref="101"/><nd ref="102"/><nd ref="103"/><nd ref="104"/><nd ref="101"/>
+    <tag k="highway" v="pedestrian"/>
+    <tag k="area" v="yes"/>
+    <tag k="name" v="Plaza A"/>
+  </way>
+  <way id="2101">
+    <nd ref="10"/><nd ref="101"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="2102">
+    <nd ref="103"/><nd ref="11"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="2103">
+    <nd ref="13"/><nd ref="12"/>
+    <tag k="highway" v="steps"/>
+  </way>
+  <way id="2104">
+    <nd ref="111"/><nd ref="112"/><nd ref="113"/><nd ref="114"/><nd ref="111"/>
+    <tag k="building" v="yes"/>
+  </way>
+  <way id="2105">
+    <nd ref="121"/><nd ref="122"/><nd ref="123"/><nd ref="124"/><nd ref="121"/>
+    <tag k="highway" v="footway"/>
+    <tag k="area" v="yes"/>
+  </way>
+  <way id="2106">
+    <nd ref="131"/><nd ref="132"/><nd ref="133"/><nd ref="134"/><nd ref="131"/>
+    <tag k="place" v="square"/>
+    <tag k="name" v="Testplatz"/>
+  </way>
+
+  <way id="3001">
+    <nd ref="201"/><nd ref="202"/><nd ref="203"/><nd ref="204"/><nd ref="201"/>
+    <tag k="highway" v="pedestrian"/>
+    <tag k="area" v="yes"/>
+    <tag k="name" v="Plaza B"/>
+  </way>
+  <way id="3101">
+    <nd ref="20"/><nd ref="201"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="3102">
+    <nd ref="203"/><nd ref="21"/>
+    <tag k="highway" v="footway"/>
+  </way>
+  <way id="3103">
+    <nd ref="201"/><nd ref="203"/>
+    <tag k="highway" v="footway"/>
+  </way>
+</osm>
