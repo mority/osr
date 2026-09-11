@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -19,7 +20,8 @@ struct http_server {
               lookup const&,
               platforms const*,
               elevation_storage const*,
-              std::string const& static_file_path);
+              std::string const& static_file_path,
+              std::filesystem::path const& area_cells_file = {});
   ~http_server();
   http_server(http_server const&) = delete;
   http_server& operator=(http_server const&) = delete;

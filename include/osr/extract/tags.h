@@ -12,6 +12,7 @@
 
 #include "osr/conditional.h"
 #include "osr/types.h"
+#include "osr/util/levels.h"
 
 namespace osr {
 
@@ -36,20 +37,6 @@ struct tags {
 private:
   template <typename TagRange>
   void parse(bool const is_relation, TagRange&& tag_range) {
-    auto const add_levels = [](std::string_view const value,
-                               level_bits_t& level_bits) {
-      auto s = utl::cstr{value};
-      while (s) {
-        auto l = 0.0F;
-        utl::parse_arg(s, l);
-        auto const lvl = level_t{std::clamp(l, kMinLevel, kMaxLevel)};
-        level_bits |= (static_cast<level_bits_t>(1) << to_idx(lvl));
-        if (s) {
-          ++s;
-        }
-      }
-    };
-
     auto circular = false;
     auto oneway_defined = false;
     for (auto const& [key, value] : tag_range) {
@@ -124,7 +111,7 @@ private:
         case cista::hash("indoor:level"): [[fallthrough]];
         case cista::hash("level"):
           has_level_ = true;
-          add_levels(value, level_bits_);
+          level_bits_ |= parse_levels(value);
           break;
         case cista::hash("name"): name_ = value; break;
         case cista::hash("ref"): ref_ = value; break;

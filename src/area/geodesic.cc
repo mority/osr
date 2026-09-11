@@ -33,6 +33,10 @@ constexpr auto kMergeDistance = 1e-2;  // 1 cm - same node, different rounding.
 // the narrowest passage worth keeping.
 constexpr auto kObstacleHalfWidth = 0.15;
 
+// How far beside a wall free space is looked for (see free_beside). Well
+// under the narrowest passage worth keeping, well over coordinate noise.
+constexpr auto kFreeBeside = 0.05;  // 5 cm
+
 struct xy {
   double x_{0.0}, y_{0.0};
 };
@@ -199,6 +203,24 @@ struct polygon {
     return on_boundary(p) || strictly_inside(p);
   }
 
+  // Is there free space right beside `p`, on either side of the line a->b?
+  // A wall is walkable along its length only where one can stand next to
+  // it. Where a hole lies against the outline, their shared edge has the
+  // hole on one side and the outside on the other: walking along it is
+  // walking through the building. That happens wherever an area's outline
+  // runs through a building - under an arcade, say - and the building is
+  // clipped to it.
+  bool free_beside(xy const a, xy const b, xy const p) const {
+    auto const len = dist(a, b);
+    if (len < kEps) {
+      return strictly_inside(p);
+    }
+    auto const nx = -(b.y_ - a.y_) / len * kFreeBeside;
+    auto const ny = (b.x_ - a.x_) / len * kFreeBeside;
+    return strictly_inside(xy{p.x_ + nx, p.y_ + ny}) ||
+           strictly_inside(xy{p.x_ - nx, p.y_ - ny});
+  }
+
   // Is the straight segment a->b fully contained in the polygon?
   //
   // Two conditions, and both are needed: no boundary edge may cross it (that
@@ -269,7 +291,9 @@ struct polygon {
         continue;
       }
       auto const s = touch[i - 1U] + gap / 2.0;
-      if (!contains(xy{a.x_ + dx * s, a.y_ + dy * s})) {
+      auto const mid = xy{a.x_ + dx * s, a.y_ + dy * s};
+      if (!strictly_inside(mid) &&
+          !(on_boundary(mid) && free_beside(a, b, mid))) {
         return false;
       }
     }
@@ -494,9 +518,14 @@ area_geodesics::area_geodesics(
     for (auto i = std::size_t{0U}; i != rv.size(); ++i) {
       auto const a = rv[i];
       auto const b = rv[(i + 1U) % rv.size()];
+      // Recorded as a ring edge either way, so the visibility test never
+      // gets to reconsider it; walkable only with free space beside it.
       if (a != b && keep[a] != 0 && keep[b] != 0 &&
           is_ring_edge.insert(pair_key(a, b)).second &&
-          !crosses_obstacle(pts[a], pts[b])) {
+          !crosses_obstacle(pts[a], pts[b]) &&
+          poly.free_beside(pts[a], pts[b],
+                           xy{0.5 * (pts[a].x_ + pts[b].x_),
+                              0.5 * (pts[a].y_ + pts[b].y_)})) {
         add_edge(a, b);
       }
     }

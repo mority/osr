@@ -35,6 +35,23 @@ TEST(area_geodesic, straight_across_convex_area) {
   EXPECT_EQ(2U, g.path(0, 1).size());
 }
 
+TEST(area_geodesic, no_walking_along_a_building_against_the_outline) {
+  // A building stands against the top edge of the area, its top wall on the
+  // outline (the area's outline runs through a building and the building was
+  // clipped to it). Along y = 100 between x = 30 and x = 70 there is building
+  // below and outside above: no one can walk there. The way from one end of
+  // the top edge to the other goes round the building.
+  auto const area = std::vector<std::vector<geo::latlng>>{
+      {at(0, 0), at(100, 0), at(100, 100), at(70, 100), at(30, 100),
+       at(0, 100)},
+      {at(30, 60), at(70, 60), at(70, 100), at(30, 100)}};
+
+  auto const g = area_geodesics{area, {at(10, 100), at(90, 100)}};
+
+  auto const round = 2.0 * std::hypot(20.0, 40.0) + 40.0;
+  EXPECT_NEAR(round, g.distance(0, 1), 0.01);
+}
+
 TEST(area_geodesic, bends_around_reflex_corner) {
   // L-shaped area: the missing quadrant is x > 40 && y > 40.
   auto const l_shape = std::vector<std::vector<geo::latlng>>{

@@ -18,10 +18,12 @@
 #include <cstring>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -34,83 +36,53 @@
 #include "utl/parser/arg_parser.h"
 #include "utl/parser/cstr.h"
 
-#include "osmium/area/assembler.hpp"
-#include "osmium/area/multipolygon_manager.hpp"
-#include "osmium/handler.hpp"
-#include "osmium/handler/node_locations_for_ways.hpp"
-#include "osmium/index/map/flex_mem.hpp"
-#include "osmium/io/pbf_input.hpp"
+// The library reads .osm.pbf; registering the XML reader here lets the
+// harness take .osm files too.
 #include "osmium/io/xml_input.hpp"
-#include "osmium/osm/area.hpp"
-#include "osmium/osm/way.hpp"
-#include "osmium/relations/relations_manager.hpp"
-#include "osmium/visitor.hpp"
+#include "osmium/osm/types.hpp"
 
-#include "cista/strong.h"
-
-#include "geo/area_db.h"
 #include "geo/box.h"
 #include "geo/latlng.h"
 
+#include "osr/area/cells.h"
 #include "osr/area/geodesic.h"
-#include "osr/extract/tags.h"
+#include "osr/area/pipeline.h"
+#include "osr/area/served.h"
+#include "osr/area/walkable.h"
 #include "osr/types.h"
 
 namespace {
 
-using index_t = osmium::index::map::FlexMem<osmium::unsigned_object_id_type,
-                                            osmium::Location>;
-using location_handler_t = osmium::handler::NodeLocationsForWays<index_t>;
-
-using area_idx_t = cista::strong<std::uint32_t, struct area_idx_>;
-
-// Which levels something is on. An object with no `level` tag matches
-// everything, following what foot::get_target_level already does with
-// kNoLevel - most of OSM is untagged and treating that as "ground floor only"
-// would disconnect far more than it fixes.
-struct level_set {
-  static level_set of(osr::tags const& t, osmium::TagList const& raw) {
-    auto const* const l = raw["layer"];
-    auto const layer = l == nullptr ? 0 : std::atoi(l);
-    return t.has_level_ ? level_set{false, t.level_bits_, layer}
-                        : level_set{true, 0U, layer};
-  }
-
-  // For things joined only by geometry - a way whose nodes fall inside an
-  // area's outline without sharing any of them. A footbridge over a plaza is
-  // inside its polygon and connects to nothing, and `layer` is what says so.
-  // osr::tags does not parse `layer` at all, so this reads it directly.
-  //
-  // Deliberately NOT applied where a node is genuinely shared: a mapper who
-  // joined a staircase to a plaza at one node meant them to connect, whatever
-  // layer the staircase carries.
-  bool matches_spatially(level_set const& o, bool const strict) const {
-    return layer_ == o.layer_ && matches(o, strict);
-  }
-
-  // `*this` is the area. Under the permissive rule an untagged object joins
-  // anything, which is right outdoors and dangerous indoors: at Chatelet a
-  // footway stub with no level tag would attach to an area three floors below
-  // it. The strict rule makes an area that states its level demand the same
-  // from whatever connects to it.
-  bool matches(level_set const& o, bool const strict) const {
-    if (strict && !any_) {
-      return !o.any_ && (bits_ & o.bits_) != 0U;
-    }
-    return any_ || o.any_ || (bits_ & o.bits_) != 0U;
-  }
-
-  void merge(level_set const& o) {
-    any_ = any_ || o.any_;
-    bits_ |= o.bits_;
-  }
-
-  bool any_{false};
-  osr::level_bits_t bits_{0U};
-  int layer_{0};
-};
+// Layers 0 to 3 - what a walkable area is, whether it needs cells, its
+// geodesics, its cells - live in the library (osr/area/pipeline.h ties them
+// together) and are tested there. These are the harness's names for layer 0.
+using level_set = osr::area_levels;
+using ring = osr::area_ring;
+using area_record = osr::walkable_area;
 
 bool g_strict_levels = false;
+
+// Overlapping areas on the same level and layer are merged before anything
+// else looks at them, unless --no-merge.
+bool g_merge = true;
+
+// Whether a place=square without any surface tag is an area (--place-square).
+bool g_place_square = false;
+
+// Whether ways mapped inside an area count as a way across it when deciding
+// if it is already served. On by default: where footways are mapped across an
+// area, routing follows them and the area gets no cells. --no-interior-ways
+// counts only the area's outline, to see area routing on its own.
+bool g_interior_ways = true;
+
+// Cells neighbour where their regions share a border, unless this is set
+// (--tree-neighbours): then each cut joins just one pair, as it used to.
+bool g_tree_neighbours = false;
+
+// Areas above this are declined as too big (--max-vertices). The strategy
+// experiments keep kMaxVertices whatever this is set to: they build the
+// visibility graph up to 21 times per area, the cells model once.
+std::size_t g_max_vertices = 400U;
 
 // The visibility graph is O(n^3) in the ring vertices, so huge areas have to
 // be declined rather than waited for. OSRM stops its mesher at 100 obstacle
@@ -124,14 +96,6 @@ constexpr auto kMaxVertices = std::size_t{400U};
 constexpr auto kMaxStarConnectors = std::size_t{120U};
 
 constexpr auto kGroupingDistance = 3.0;  // Valhalla's kEntranceGroupingMeters.
-
-// How much shorter the crossing has to be than the way round for the pair to
-// count as one the area model is responsible for.
-constexpr auto kRelevantDetour = 1.2;
-
-// How much worse than the geodesic the existing ways may be before the area is
-// judged to need meshing of its own.
-constexpr auto kServedRatio = 1.2;
 
 // Depth of the placeholder subdivision used to measure error composition.
 constexpr auto kMaxSplitDepth = std::size_t{3U};
@@ -152,328 +116,6 @@ constexpr auto kFitIterations = 4;
 // assumption the whole flat-cost framework was built on; it is only neutral
 // for routes already inside the same pair of cells.
 std::size_t g_portals_per_border = 1U;
-
-bool one_of_sv(std::string_view const value,
-               std::initializer_list<char const*> options) {
-  return !value.empty() && std::ranges::any_of(options, [&](char const* o) {
-    return value == o;
-  });
-}
-
-bool one_of(char const* value, std::initializer_list<char const*> options) {
-  return value != nullptr && std::ranges::any_of(options, [&](char const* o) {
-           return std::strcmp(value, o) == 0;
-         });
-}
-
-// A way whose interior a pedestrian can cross freely. Deliberately excludes
-// `area:highway`-only ways (that scheme draws the road surface alongside the
-// linear way that already carries the routing, so meshing it would build a
-// second parallel network) and public_transport=station (an area covering the
-// whole station would teleport between levels).
-bool is_routable_area(osmium::Area const& area) {
-  auto const& t = area.tags();
-  if (t.has_tag("public_transport", "station") || t.has_tag("area", "no")) {
-    return false;
-  }
-
-  auto const* const place = t["place"];
-  auto const is_surface =
-      one_of(t["highway"], {"pedestrian", "footway", "path", "living_street",
-                            "service", "corridor", "platform", "steps"}) ||
-      one_of(t["public_transport"], {"platform"}) ||
-      one_of(t["railway"], {"platform"}) || one_of(place, {"square"});
-  if (!is_surface) {
-    return false;
-  }
-
-  // A closed `highway=footway` without `area=yes` is a loop, not a surface.
-  // A multipolygon relation is an area by construction.
-  return !area.from_way() || t.has_tag("area", "yes") ||
-         one_of(place, {"square"});
-}
-
-// The linear network: ways that carry routing in the ordinary way. Their nodes
-// are what the areas connect to.
-bool is_linear_routable(osmium::Way const& w) {
-  return w.tags().has_key("highway") && !w.tags().has_tag("area", "yes");
-}
-
-// A point where the linear network stops inside an area rather than on its
-// edge - the end of a staircase, a lift shaft, a footway stub. osm-hints.txt
-// asks for these explicitly: they are entries the boundary never sees.
-struct loose_end {
-  osmium::object_id_type id_{0};
-  geo::latlng pos_;
-  level_set levels_;
-};
-
-// An edge of the existing linear network that lies wholly inside one area.
-struct interior_edge {
-  osmium::object_id_type a_, b_;
-};
-
-struct linear_collector : public osmium::handler::Handler {
-  linear_collector(geo::area_db_lookup<area_idx_t> const& lookup,
-                   osr::hash_map<osmium::object_id_type,
-                                 std::vector<area_idx_t>> const& ring_areas,
-                   std::vector<level_set> const& area_levels)
-      : lookup_{lookup},
-        ring_areas_{ring_areas},
-        area_levels_{area_levels},
-        interior_edges_(area_levels.size()),
-        barriers_(area_levels.size()),
-        buildings_(area_levels.size()) {}
-
-  // Every area this node lies in - strictly inside by the rtree, or on the
-  // boundary by being one of its ring nodes.
-  std::vector<area_idx_t> const& areas_of(osmium::object_id_type const id,
-                                          geo::latlng const& pos) {
-    scratch_.clear();
-    lookup_.lookup(pos, hits_);
-    scratch_.assign(begin(hits_), end(hits_));
-    if (auto const it = ring_areas_.find(id); it != end(ring_areas_)) {
-      scratch_.insert(end(scratch_), begin(it->second), end(it->second));
-    }
-    std::ranges::sort(scratch_);
-    scratch_.erase(std::ranges::unique(scratch_).begin(), end(scratch_));
-    return scratch_;
-  }
-
-  void node(osmium::Node const& n) {
-    if (!n.location().valid()) {
-      return;
-    }
-    auto const t = osr::tags{n};
-    // A lift or a marked entrance standing inside an area is an entry to it
-    // even though no way of the area passes through it.
-    if (t.is_elevator_ || t.is_entrance_) {
-      loose_ends_.push_back(loose_end{n.id(),
-                                      {n.location().lat(), n.location().lon()},
-                                      level_set::of(t, n.tags())});
-    }
-  }
-
-  // Physical obstacles drawn as ways. A fence across a plaza is invisible to
-  // the polygon, so both the "already served" test and any visibility graph
-  // built later would happily cross it.
-  static bool is_obstacle(osr::tags const& t) {
-    return one_of_sv(t.barrier_, {"yes", "wall", "fence", "hedge",
-                                  "retaining_wall", "city_wall", "guard_rail"});
-  }
-
-  void way(osmium::Way const& w) {
-    auto const raw_t = osr::tags{w};
-
-    // Barriers and buildings are not routable, so they are counted here and
-    // then dropped. Containment is the strict rtree test, never ring
-    // membership: a fence along the outline is the wall of the area, not an
-    // obstacle inside it, and a building mapped as an inner ring has its nodes
-    // on the boundary rather than within.
-    if (is_obstacle(raw_t) || w.tags().has_key("building")) {
-      auto const obstacle = is_obstacle(raw_t);
-      auto const levels = level_set::of(raw_t, w.tags());
-
-      auto pts = std::vector<geo::latlng>{};
-      auto inside = std::vector<std::vector<area_idx_t>>{};
-      auto touched = std::vector<area_idx_t>{};
-      for (auto const& n : w.nodes()) {
-        if (!n.location().valid()) {
-          continue;
-        }
-        auto const pos = geo::latlng{n.location().lat(), n.location().lon()};
-        lookup_.lookup(pos, hits_);
-        auto cur = std::vector<area_idx_t>{};
-        for (auto const a : hits_) {
-          if (area_levels_[to_idx(a)].matches_spatially(levels,
-                                                        g_strict_levels)) {
-            cur.push_back(a);
-            touched.push_back(a);
-          }
-        }
-        pts.push_back(pos);
-        inside.push_back(std::move(cur));
-      }
-      std::ranges::sort(touched);
-      touched.erase(std::ranges::unique(touched).begin(), end(touched));
-
-      for (auto const a : touched) {
-        auto const in = [&](std::size_t const i) {
-          return std::ranges::find(inside[i], a) != end(inside[i]);
-        };
-        if (obstacle) {
-          // Keep a segment if either end is inside: a fence crossing the
-          // outline blocks just as much as one wholly within it.
-          for (auto i = std::size_t{0U}; i + 1U < pts.size(); ++i) {
-            if (in(i) || in(i + 1U)) {
-              barriers_[to_idx(a)].push_back({pts[i], pts[i + 1U]});
-            }
-          }
-        } else if (pts.size() >= 4U && pts.front() == pts.back()) {
-          buildings_[to_idx(a)].push_back(
-              std::vector<geo::latlng>{begin(pts), end(pts) - 1});
-        }
-      }
-
-      if (!is_linear_routable(w)) {
-        return;
-      }
-    }
-
-    if (!is_linear_routable(w)) {
-      return;
-    }
-    auto const t = raw_t;
-
-    // access=private / access=no: reachable on the map, not in the world.
-    auto const restricted =
-        t.access_ == osr::override::kBlacklist || t.private_access_;
-    if (restricted) {
-      ++n_restricted_ways_;
-    } else {
-      for (auto const& n : w.nodes()) {
-        unrestricted_nodes_.insert(n.ref());
-      }
-    }
-    auto const levels = level_set::of(t, w.tags());
-    if (t.has_level_) {
-      ++n_with_level_;
-    }
-    ++n_ways_;
-
-    for (auto const& n : w.nodes()) {
-      node_levels_[n.ref()].merge(levels);
-    }
-
-    // Record the stretches of this way that stay inside an area: those are
-    // the ways "mapped onto" the area, which the router can already use.
-    auto prev_areas = std::vector<area_idx_t>{};
-    auto prev_id = osmium::object_id_type{0};
-    auto have_prev = false;
-    for (auto const& n : w.nodes()) {
-      if (!n.location().valid()) {
-        have_prev = false;
-        continue;
-      }
-      auto const pos = geo::latlng{n.location().lat(), n.location().lon()};
-      auto const& areas = areas_of(n.ref(), pos);
-      if (!areas.empty()) {
-        node_pos_[n.ref()] = pos;
-      }
-      if (have_prev) {
-        for (auto const a : areas) {
-          if (std::ranges::find(prev_areas, a) == end(prev_areas)) {
-            continue;
-          }
-          if (area_levels_[to_idx(a)].matches_spatially(levels,
-                                                        g_strict_levels)) {
-            interior_edges_[to_idx(a)].push_back({prev_id, n.ref()});
-          } else {
-            ++n_rejected_edges_;
-          }
-        }
-      }
-      prev_areas.assign(begin(areas), end(areas));
-      prev_id = n.ref();
-      have_prev = true;
-    }
-
-    for (auto const* end : {&w.nodes().front(), &w.nodes().back()}) {
-      if (end->location().valid()) {
-        loose_ends_.push_back(
-            loose_end{end->ref(),
-                      {end->location().lat(), end->location().lon()},
-                      levels});
-      }
-    }
-  }
-
-  geo::area_db_lookup<area_idx_t> const& lookup_;
-  osr::hash_map<osmium::object_id_type, std::vector<area_idx_t>> const&
-      ring_areas_;
-  std::vector<level_set> const& area_levels_;
-
-  osr::hash_map<osmium::object_id_type, level_set> node_levels_;
-  osr::hash_map<osmium::object_id_type, geo::latlng> node_pos_;
-  std::vector<loose_end> loose_ends_;
-  std::vector<std::vector<interior_edge>> interior_edges_;
-  std::vector<std::vector<std::vector<geo::latlng>>> barriers_;
-  std::vector<std::vector<std::vector<geo::latlng>>> buildings_;
-  osr::hash_set<osmium::object_id_type> unrestricted_nodes_;
-  int n_restricted_ways_{0};
-  int n_ways_{0};
-  int n_with_level_{0};
-  int n_rejected_edges_{0};
-
-private:
-  geo::area_db_lookup<area_idx_t>::rtree_results_t hits_;
-  std::vector<area_idx_t> scratch_;
-};
-
-struct ring {
-  std::vector<osmium::object_id_type> ids_;
-  std::vector<geo::latlng> points_;
-};
-
-struct area_record {
-  osmium::object_id_type id_{0};
-  bool from_way_{false};
-  std::string name_;
-  level_set levels_;
-  std::vector<ring> rings_;
-};
-
-struct area_collector : public osmium::handler::Handler {
-  void area(osmium::Area const& a) {
-    if (!is_routable_area(a)) {
-      return;
-    }
-
-    auto const t = osr::tags{a};
-    if (t.has_level_) {
-      ++n_with_level_;
-    }
-    auto rec = area_record{.id_ = a.orig_id(),
-                           .from_way_ = a.from_way(),
-                           .levels_ = level_set::of(t, a.tags())};
-    if (auto const* const name = a.tags()["name"]; name != nullptr) {
-      rec.name_ = name;
-    }
-
-    auto const add_ring = [&](auto const& r) {
-      auto& out = rec.rings_.emplace_back();
-      for (auto const& n : r) {
-        if (!n.location().valid()) {
-          continue;
-        }
-        out.ids_.push_back(n.ref());
-        out.points_.push_back({n.lat(), n.lon()});
-      }
-    };
-
-    // Only the first outer ring is kept: an area with several disjoint outer
-    // rings is several areas as far as crossing it goes, and splitting them
-    // properly is extraction work, not measurement work.
-    auto first = true;
-    for (auto const& outer : a.outer_rings()) {
-      if (!first) {
-        break;
-      }
-      first = false;
-      add_ring(outer);
-      for (auto const& inner : a.inner_rings(outer)) {
-        add_ring(inner);
-      }
-    }
-
-    if (!rec.rings_.empty() && rec.rings_.front().points_.size() >= 3U) {
-      areas_.push_back(std::move(rec));
-    }
-  }
-
-  std::vector<area_record> areas_;
-  int n_with_level_{0};
-};
 
 struct pair_stats {
   std::size_t n_pairs_{0U};
@@ -613,89 +255,6 @@ std::vector<std::size_t> group_connectors(
     }
   }
   return reps;
-}
-
-// Shortest distances between the area's connectors over the ways that already
-// exist: its ring, plus every linear-network edge lying inside it. A connector
-// with no such edge stays unreachable, which is the honest answer - a stub
-// ending inside an area cannot be crossed to without crossing the area.
-std::vector<double> network_distances(
-    area_record const& a,
-    std::vector<interior_edge> const& interior,
-    osr::hash_map<osmium::object_id_type, geo::latlng> const& node_pos,
-    std::vector<osmium::object_id_type> const& connector_ids) {
-  auto idx_of = osr::hash_map<osmium::object_id_type, std::size_t>{};
-  auto pos = std::vector<geo::latlng>{};
-  auto adj = std::vector<std::vector<std::pair<std::size_t, double>>>{};
-
-  auto const add_node = [&](osmium::object_id_type const id,
-                            geo::latlng const& p) {
-    if (auto const it = idx_of.find(id); it != end(idx_of)) {
-      return it->second;
-    }
-    idx_of[id] = pos.size();
-    pos.push_back(p);
-    adj.emplace_back();
-    return pos.size() - 1U;
-  };
-  auto const add_edge = [&](std::size_t const u, std::size_t const v) {
-    if (u == v) {
-      return;
-    }
-    auto const d = geo::distance(pos[u], pos[v]);
-    adj[u].emplace_back(v, d);
-    adj[v].emplace_back(u, d);
-  };
-
-  for (auto const& r : a.rings_) {
-    for (auto i = std::size_t{0U}; i != r.ids_.size(); ++i) {
-      auto const j = (i + 1U) % r.ids_.size();
-      add_edge(add_node(r.ids_[i], r.points_[i]),
-               add_node(r.ids_[j], r.points_[j]));
-    }
-  }
-  for (auto const& e : interior) {
-    auto const pa = node_pos.find(e.a_);
-    auto const pb = node_pos.find(e.b_);
-    if (pa != end(node_pos) && pb != end(node_pos)) {
-      add_edge(add_node(e.a_, pa->second), add_node(e.b_, pb->second));
-    }
-  }
-
-  auto const k = connector_ids.size();
-  auto const inf = std::numeric_limits<double>::infinity();
-  auto out = std::vector<double>(k * k, inf);
-  auto d = std::vector<double>{};
-  using entry = std::pair<double, std::size_t>;
-  for (auto i = std::size_t{0U}; i != k; ++i) {
-    auto const it = idx_of.find(connector_ids[i]);
-    if (it == end(idx_of)) {
-      continue;
-    }
-    d.assign(pos.size(), inf);
-    d[it->second] = 0.0;
-    auto q = std::priority_queue<entry, std::vector<entry>, std::greater<>>{};
-    q.emplace(0.0, it->second);
-    while (!q.empty()) {
-      auto const [cost, u] = q.top();
-      q.pop();
-      if (cost > d[u]) {
-        continue;
-      }
-      for (auto const& [v, w] : adj[u]) {
-        if (auto const next = cost + w; next < d[v]) {
-          d[v] = next;
-          q.emplace(next, v);
-        }
-      }
-    }
-    for (auto j = std::size_t{0U}; j != k; ++j) {
-      if (auto const jt = idx_of.find(connector_ids[j]); jt != end(idx_of)) {
-        out[i * k + j] = d[jt->second];
-      }
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,26 +1342,6 @@ triangulation greedy_triangulation(
   return t;
 }
 
-// Cumulative arc length around the outer ring, computed once per area.
-std::vector<double> ring_arc_lengths(ring const& outer) {
-  auto cum = std::vector<double>(outer.points_.size() + 1U, 0.0);
-  for (auto i = std::size_t{0U}; i != outer.points_.size(); ++i) {
-    cum[i + 1U] =
-        cum[i] + geo::distance(outer.points_[i],
-                               outer.points_[(i + 1U) % outer.points_.size()]);
-  }
-  return cum;
-}
-
-// Shortest way between two connectors that stays on the outer ring - what osr
-// does today.
-double perimeter_distance(std::vector<double> const& cum,
-                          std::size_t const a,
-                          std::size_t const b) {
-  auto const along = std::abs(cum[a] - cum[b]);
-  return std::min(along, cum.back() - along);
-}
-
 struct percentiles {
   double p50_{0.0}, p90_{0.0}, p95_{0.0}, max_{0.0};
 };
@@ -1822,114 +1361,336 @@ percentiles quantiles_of(std::vector<double> v) {
 
 }  // namespace
 
+// The chosen model as osr::build_area_cells builds it - no portals, one fit.
+// Route errors come out in the pair order evaluate_composition reports them,
+// so the two implementations can be compared entry by entry.
+struct library_run {
+  std::size_t n_cells_{0U};
+  std::vector<double> errors_;
+};
+
+std::optional<library_run> run_library(
+    std::vector<geo::latlng> const& connectors,
+    std::vector<float> const& dist,
+    std::vector<bool> const& relevant,
+    double const threshold) {
+  auto const cells = osr::build_area_cells(connectors, dist, relevant,
+                                           {.threshold_ = threshold});
+  if (!cells.has_value()) {
+    return std::nullopt;
+  }
+  auto const k = connectors.size();
+  auto const m = cells->n_cells();
+  auto const cd = cells->cell_distances();
+  auto run = library_run{.n_cells_ = m, .errors_ = {}};
+  for (auto src = std::size_t{0U}; src != k; ++src) {
+    for (auto dst = src + 1U; dst != k; ++dst) {
+      auto const truth = dist[src * k + dst];
+      auto const a = cells->connector_cell_[src];
+      auto const b = cells->connector_cell_[dst];
+      if (truth == osr::area_geodesics::kUnreachable || truth < 1.0 ||
+          a == osr::area_cells::kNoCell || b == osr::area_cells::kNoCell ||
+          !std::isfinite(cd[a * m + b])) {
+        continue;
+      }
+      auto const model = cd[a * m + b];
+      run.errors_.push_back(
+          std::abs(static_cast<double>(model) - static_cast<double>(truth)));
+    }
+  }
+  return run;
+}
+
+// Every area the harness looks at, as GeoJSON for osr-backend's area layer:
+// its outline with a status saying what the funnel decided, and for meshed
+// areas the cells - connectors coloured by cell, hubs, spokes, and the
+// neighbour links between hubs.
+struct cells_dump {
+  static std::string escape(std::string_view const s) {
+    auto out = std::string{};
+    for (auto const ch : s) {
+      if (ch == '"' || ch == '\\') {
+        out.push_back('\\');
+        out.push_back(ch);
+      } else if (static_cast<unsigned char>(ch) < 0x20U) {
+        out += fmt::format("\\u{:04x}", static_cast<unsigned>(ch));
+      } else {
+        out.push_back(ch);
+      }
+    }
+    return out;
+  }
+
+  static std::string coord(geo::latlng const& p) {
+    return fmt::format("[{:.7f},{:.7f}]", p.lng(), p.lat());
+  }
+
+  static std::string coords(std::vector<geo::latlng> const& line,
+                            bool const close) {
+    auto out = std::string{"["};
+    for (auto const& p : line) {
+      if (out.size() != 1U) {
+        out.push_back(',');
+      }
+      out += coord(p);
+    }
+    if (close && !line.empty() && line.front() != line.back()) {
+      out += "," + coord(line.front());
+    }
+    return out + "]";
+  }
+
+  void feature(std::string const& geometry, std::string const& properties) {
+    features_.push_back(fmt::format(
+        R"({{"type":"Feature","geometry":{},"properties":{{{}}}}})", geometry,
+        properties));
+  }
+
+  void area(area_record const& a,
+            std::vector<std::vector<geo::latlng>> const& rings,
+            std::vector<std::vector<geo::latlng>> const& barriers,
+            std::vector<geo::latlng> const& connectors,
+            std::vector<osmium::object_id_type> const& connector_ids,
+            std::vector<char> const& on_ring,
+            std::string_view const status,
+            osr::area_cells const* cells = nullptr,
+            std::vector<float> const* dist = nullptr,
+            std::vector<std::vector<osr::area_cut_side>> const* regions =
+                nullptr) {
+    // Every feature carries its area's id and levels, so a whole area can be
+    // selected - and filtered by level - from any of its features. An area
+    // without a level tag gets no "levels" at all.
+    // "area" tells apart the pieces of a merge, which share their "osm".
+    auto osm = fmt::format(R"("osm":"{}/{}","area":{})",
+                           a.from_way_ ? "way" : "relation", a.id_,
+                           n_areas_++);
+    if (!a.levels_.any_) {
+      auto levels = std::string{};
+      for (auto b = 0U; b != 64U; ++b) {
+        if (((a.levels_.bits_ >> b) & 1U) != 0U) {
+          levels += fmt::format("{}{}", levels.empty() ? "" : ",",
+                                osr::level_t{static_cast<std::uint8_t>(b)}
+                                    .to_float());
+        }
+      }
+      osm += fmt::format(R"(,"levels":[{}])", levels);
+    }
+
+    auto polygon = std::string{};
+    for (auto const& r : rings) {
+      if (r.size() >= 3U) {
+        polygon += (polygon.empty() ? "" : ",") + coords(r, true);
+      }
+    }
+    auto extra = std::string{};
+    if (!a.members_.empty()) {
+      auto members = std::string{};
+      for (auto const& m : a.members_) {
+        members += (members.empty() ? "" : " ") + m;
+      }
+      extra += fmt::format(R"(,"members":"{}")", members);
+    }
+    if (cells != nullptr) {
+      auto const k = connectors.size();
+      auto const m = cells->n_cells();
+      auto const cd = cells->cell_distances();
+      auto errors = std::vector<double>{};
+      for (auto i = std::size_t{0U}; i != k; ++i) {
+        for (auto j = i + 1U; j != k; ++j) {
+          auto const truth = (*dist)[i * k + j];
+          auto const a = cells->connector_cell_[i];
+          auto const b = cells->connector_cell_[j];
+          if (truth != osr::area_geodesics::kUnreachable && truth >= 1.0 &&
+              a != osr::area_cells::kNoCell && b != osr::area_cells::kNoCell) {
+            errors.push_back(std::abs(static_cast<double>(cd[a * m + b]) -
+                                      static_cast<double>(truth)));
+          }
+        }
+      }
+      extra += fmt::format(
+          R"(,"cells":{},"unreachable_connectors":{})", m,
+          std::ranges::count(cells->connector_cell_, osr::area_cells::kNoCell));
+      all_errors_.insert(end(all_errors_), begin(errors), end(errors));
+      cells_per_area_.push_back(static_cast<double>(m));
+      if (!errors.empty()) {
+        auto const q = quantiles_of(errors);
+        extra += fmt::format(R"(,"err_p50":{:.1f},"err_max":{:.1f})", q.p50_,
+                             q.max_);
+      }
+    }
+    feature(fmt::format(R"({{"type":"Polygon","coordinates":[{}]}})", polygon),
+            fmt::format(R"("kind":"area",{},"name":"{}","status":"{}",)"
+                        R"("connectors":{}{})",
+                        osm, escape(a.name_), status, connectors.size(),
+                        extra));
+
+    // Cell regions (osr::region_rings), for drawing.
+    if (cells != nullptr && regions != nullptr) {
+      auto const polygons = osr::region_rings(rings, *regions);
+      for (auto c = std::size_t{0U}; c != polygons.size(); ++c) {
+        auto region = std::string{};
+        for (auto const& r : polygons[c]) {
+          region += (region.empty() ? "" : ",") + coords(r, true);
+        }
+        if (!region.empty()) {
+          feature(
+              fmt::format(R"({{"type":"Polygon","coordinates":[{}]}})", region),
+              fmt::format(R"("kind":"cell",{},"cell":{},"cost":{:.1f})", osm,
+                          c, cells->cost_[c]));
+        }
+      }
+    }
+
+    for (auto const& b : barriers) {
+      feature(fmt::format(R"({{"type":"LineString","coordinates":{}}})",
+                          coords(b, false)),
+              fmt::format(R"("kind":"barrier",{})", osm));
+    }
+
+    auto hubs = std::vector<geo::latlng>{};
+    if (cells != nullptr) {
+      hubs = osr::hub_positions(*cells, connectors);
+      auto members = std::vector<int>(cells->n_cells(), 0);
+      for (auto const c : cells->connector_cell_) {
+        if (c != osr::area_cells::kNoCell) {
+          ++members[c];
+        }
+      }
+      for (auto c = std::size_t{0U}; c != hubs.size(); ++c) {
+        feature(fmt::format(R"({{"type":"Point","coordinates":{}}})",
+                            coord(hubs[c])),
+                fmt::format(R"("kind":"hub",{},"cell":{},"cost":{:.1f},)"
+                            R"("members":{})",
+                            osm, c, cells->cost_[c], members[c]));
+        for (auto d = c + 1U; d != hubs.size(); ++d) {
+          if (cells->is_neighbour(static_cast<osr::area_cells::cell_idx_t>(c),
+                                  static_cast<osr::area_cells::cell_idx_t>(d))) {
+            feature(fmt::format(R"({{"type":"LineString","coordinates":{}}})",
+                                coords({hubs[c], hubs[d]}, false)),
+                    fmt::format(R"("kind":"neighbour",{},"from":{},"to":{},)"
+                                R"("cost":{:.1f})",
+                                osm, c, d,
+                                0.5 * (cells->cost_[c] + cells->cost_[d])));
+          }
+        }
+      }
+    }
+
+    for (auto i = std::size_t{0U}; i != connectors.size(); ++i) {
+      auto cell = std::string{};
+      if (cells != nullptr && cells->connector_cell_[i] == osr::area_cells::kNoCell) {
+        cell = R"(,"unreachable":true)";
+      } else if (cells != nullptr) {
+        auto const c = cells->connector_cell_[i];
+        cell = fmt::format(R"(,"cell":{})", c);
+        feature(fmt::format(R"({{"type":"LineString","coordinates":{}}})",
+                            coords({connectors[i], hubs[c]}, false)),
+                fmt::format(R"("kind":"spoke",{},"cell":{},"cost":{:.1f})",
+                            osm, c, 0.5 * cells->cost_[c]));
+      }
+      feature(fmt::format(R"({{"type":"Point","coordinates":{}}})",
+                          coord(connectors[i])),
+              fmt::format(R"("kind":"connector",{},"node":{},"interior":{}{})",
+                          osm, connector_ids[i], on_ring[i] == 0, cell));
+    }
+  }
+
+  void write(std::filesystem::path const& p) const {
+    auto out = std::ofstream{p};
+    out << R"({"type":"FeatureCollection","features":[)";
+    for (auto i = std::size_t{0U}; i != features_.size(); ++i) {
+      out << (i == 0U ? "" : ",\n") << features_[i];
+    }
+    out << "]}\n";
+    fmt::print("wrote {} features to {}\n", features_.size(), p.string());
+    if (!all_errors_.empty()) {
+      auto const e = quantiles_of(all_errors_);
+      auto const c = quantiles_of(cells_per_area_);
+      fmt::print(
+          "  the model as written ({}): cells/area p50 {:.0f} p90 {:.0f} | "
+          "route err p50 {:.1f} p90 {:.1f} p95 {:.1f}\n",
+          g_tree_neighbours ? "one neighbour pair per cut"
+                            : "cells neighbour where they share a border",
+          c.p50_, c.p90_, e.p50_, e.p90_, e.p95_);
+    }
+  }
+
+  std::vector<std::string> features_;
+  std::size_t n_areas_{0U};
+  std::vector<double> all_errors_;
+  std::vector<double> cells_per_area_;
+};
+
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fmt::print(stderr, "usage: {} <osm-file> [more-osm-files...]\n", argv[0]);
+    fmt::print(stderr,
+               "usage: {} [--strict-levels] [--cells-out <geojson>] "
+               "[--cells-t <meters>] [--max-vertices <n>] "
+               "[--no-interior-ways] [--place-square] [--no-merge] "
+               "[--tree-neighbours] <osm-file> [more-osm-files...]\n",
+               argv[0]);
     return 1;
   }
 
+  // Options apply to the files after them.
+  auto cells_out = std::optional<std::filesystem::path>{};
+  auto cells_t = 10.0;
+  auto dump = cells_dump{};
   for (auto arg = 1; arg != argc; ++arg) {
-    if (std::string_view{argv[arg]} == "--strict-levels") {
+    auto const opt = std::string_view{argv[arg]};
+    if (opt == "--strict-levels") {
       g_strict_levels = true;
+      continue;
+    }
+    if (opt == "--cells-out" && arg + 1 != argc) {
+      cells_out = argv[++arg];
+      continue;
+    }
+    if (opt == "--cells-t" && arg + 1 != argc) {
+      cells_t = std::stod(argv[++arg]);
+      continue;
+    }
+    if (opt == "--no-interior-ways") {
+      g_interior_ways = false;
+      continue;
+    }
+    if (opt == "--place-square") {
+      g_place_square = true;
+      continue;
+    }
+    if (opt == "--no-merge") {
+      g_merge = false;
+      continue;
+    }
+    if (opt == "--tree-neighbours") {
+      g_tree_neighbours = true;
+      continue;
+    }
+    if (opt == "--max-vertices" && arg + 1 != argc) {
+      g_max_vertices = std::stoul(argv[++arg]);
       continue;
     }
     auto const path = std::string{argv[arg]};
     fmt::print("\n===== {} =====\n",
                std::filesystem::path{path}.filename().string());
 
-    auto assembler_config = osmium::area::Assembler::config_type{};
-    assembler_config.create_empty_areas = false;
-
-    auto filter = osmium::TagsFilter{false};
-    filter.add_rule(true, "highway");
-    filter.add_rule(true, "place", "square");
-    filter.add_rule(true, "public_transport", "platform");
-    filter.add_rule(true, "railway", "platform");
-
-    auto mp_manager =
-        osmium::area::MultipolygonManager<osmium::area::Assembler>{
-            assembler_config, filter};
-    osmium::relations::read_relations(osmium::io::File{path}, mp_manager);
-
-    // Areas come first: the linear pass needs to know which area each node
-    // falls in, and that needs the assembled rings.
-    auto collector = area_collector{};
-    {
-      auto index = index_t{};
-      auto location_handler = location_handler_t{index};
-      location_handler.ignore_errors();
-      auto reader = osmium::io::Reader{path, osmium::io::read_meta::no};
-      osmium::apply(reader, location_handler,
-                    mp_manager.handler([&](osmium::memory::Buffer&& buffer) {
-                      osmium::apply(buffer, collector);
-                    }));
-      reader.close();
+    // Layer 0 (osr/area/pipeline.h): the walkable areas and what is in them.
+    auto const options =
+        osr::area_options{.walkable_ = {.place_square_ = g_place_square},
+                          .strict_levels_ = g_strict_levels,
+                          .merge_ = g_merge,
+                          .interior_ways_ = g_interior_ways,
+                          .max_vertices_ = g_max_vertices,
+                          .cells_threshold_ = cells_t,
+                          .shared_borders_ = !g_tree_neighbours};
+    auto const data = osr::collect_areas(path, options);
+    if (g_merge) {
+      auto const& m = data.merged_;
+      fmt::print(
+          "merged {} overlapping areas (same level and layer) into {}, "
+          "{} groups left unmerged because the union failed\n",
+          m.n_members_, m.n_merged_, m.n_failed_);
     }
-
-    auto ring_areas =
-        osr::hash_map<osmium::object_id_type, std::vector<area_idx_t>>{};
-    auto area_levels = std::vector<level_set>{};
-    for (auto const [i, a] : utl::enumerate(collector.areas_)) {
-      area_levels.push_back(a.levels_);
-      auto seen = osr::hash_set<osmium::object_id_type>{};
-      for (auto const& r : a.rings_) {
-        for (auto const id : r.ids_) {
-          if (seen.insert(id).second) {
-            ring_areas[id].push_back(area_idx_t{static_cast<std::uint32_t>(i)});
-          }
-        }
-      }
-    }
-
-    // geo::area_db carries the rings and answers the contains-test, which is
-    // what osm-hints.txt asks be reused rather than rebuilt.
-    auto const db_dir =
-        std::filesystem::temp_directory_path() /
-        fmt::format("osr-area-stats-{:x}", std::hash<std::string>{}(path));
-    std::filesystem::remove_all(db_dir);
-    std::filesystem::create_directories(db_dir);
-    auto storage = geo::area_db_storage<area_idx_t>{
-        db_dir, cista::mmap::protection::WRITE};
-    for (auto const& a : collector.areas_) {
-      auto outers = std::vector<std::vector<geo::fixed_latlng>>{};
-      auto inners = std::vector<std::vector<std::vector<geo::fixed_latlng>>>{};
-      auto& outer = outers.emplace_back();
-      auto& inner_group = inners.emplace_back();
-      for (auto const& p : a.rings_.front().points_) {
-        outer.push_back(geo::fixed_latlng::from_latlng(p));
-      }
-      for (auto i = std::size_t{1U}; i != a.rings_.size(); ++i) {
-        auto& in = inner_group.emplace_back();
-        for (auto const& p : a.rings_[i].points_) {
-          in.push_back(geo::fixed_latlng::from_latlng(p));
-        }
-      }
-      storage.add_area(outers, inners);
-    }
-    auto const lookup = geo::area_db_lookup<area_idx_t>{storage};
-
-    auto linear = linear_collector{lookup, ring_areas, area_levels};
-    {
-      auto index = index_t{};
-      auto location_handler = location_handler_t{index};
-      location_handler.ignore_errors();
-      auto reader = osmium::io::Reader{path, osmium::io::read_meta::no};
-      osmium::apply(reader, location_handler, linear);
-      reader.close();
-    }
-
-    auto loose_by_area =
-        std::vector<std::vector<loose_end>>(collector.areas_.size());
-    {
-      auto hits = geo::area_db_lookup<area_idx_t>::rtree_results_t{};
-      for (auto const& le : linear.loose_ends_) {
-        lookup.lookup(le.pos_, hits);
-        for (auto const a : hits) {
-          loose_by_area[to_idx(a)].push_back(le);
-        }
-      }
-    }
-    std::filesystem::remove_all(db_dir);
 
     auto n_no_crossing = 0;
     auto n_reported = 0;
@@ -1965,6 +1726,11 @@ int main(int argc, char** argv) {
     auto oa_route_err = std::map<double, std::vector<double>>{};
     auto rf_cells = std::map<double, std::vector<double>>{};
     auto rf_route_err = std::map<double, std::vector<double>>{};
+    auto lib_cells = std::map<double, std::vector<double>>{};
+    auto lib_route_err = std::map<double, std::vector<double>>{};
+    auto lib_compared = 0;
+    auto lib_mismatches = 0;
+    auto lib_extra = 0;
     auto ad_cells = std::map<double, std::vector<double>>{};
     auto ad_route_err = std::map<double, std::vector<double>>{};
     auto ad_route_err_global = std::map<double, std::vector<double>>{};
@@ -2004,103 +1770,40 @@ int main(int argc, char** argv) {
     };
     auto worst = std::vector<worst_entry>{};
 
-    for (auto const [area_i, a] : utl::enumerate(collector.areas_)) {
-      auto rings = std::vector<std::vector<geo::latlng>>{};
-      auto n_vertices = std::size_t{0U};
-      for (auto const& r : a.rings_) {
-        rings.push_back(r.points_);
-        n_vertices += r.points_.size();
-      }
-
-      // Connector positions, plus where each sits on the outer ring so the
-      // perimeter route can be measured against the geodesic.
+    for (auto const [area_i, a] : utl::enumerate(data.areas_)) {
+      // Layers 1 to 3 (osr/area/pipeline.h). The geodesics are built for
+      // every area, served or not, for the statistics below.
+      auto const pa = osr::prepare_area(data, area_i, options, true,
+                                        cells_out.has_value());
+      auto const& rings = pa.rings_;
+      auto const& barriers = pa.barriers_;
       auto connectors = std::vector<geo::latlng>{};
       auto connector_ids = std::vector<osmium::object_id_type>{};
       auto on_ring = std::vector<char>{};
-      auto outer_pos = std::vector<std::size_t>{};
-      auto const& outer = a.rings_.front();
-      auto seen = osr::hash_set<osmium::object_id_type>{};
-      for (auto const& r : a.rings_) {
-        for (auto i = std::size_t{0U}; i != r.ids_.size(); ++i) {
-          auto const id = r.ids_[i];
-
-          // The linear network meets the boundary here, on a level this area
-          // is actually on.
-          auto meets_network = false;
-          if (auto const it = linear.node_levels_.find(id);
-              it != end(linear.node_levels_)) {
-            meets_network = a.levels_.matches(it->second, g_strict_levels);
-          }
-
-          // Or a neighbouring area shares this node, on a shared level.
-          auto meets_area = false;
-          if (auto const it = ring_areas.find(id); it != end(ring_areas)) {
-            auto n_matching = 0;
-            for (auto const other : it->second) {
-              n_matching +=
-                  a.levels_.matches(area_levels[to_idx(other)], g_strict_levels)
-                      ? 1
-                      : 0;
-            }
-            meets_area = n_matching > 1;
-          }
-
-          if ((!meets_network && !meets_area) || !seen.insert(id).second) {
-            continue;
-          }
-          // Reachable on the map but not in the world: every way meeting the
-          // area here is access=private or access=no.
-          if (meets_network && !meets_area &&
-              !linear.unrestricted_nodes_.contains(id)) {
-            ++n_restricted_connectors;
-            continue;
-          }
-          ++n_boundary_connectors;
-          connector_ids.push_back(id);
-          on_ring.push_back(1);
-          connectors.push_back(r.points_[i]);
-          outer_pos.push_back(
-              &r == &outer ? i : std::numeric_limits<std::size_t>::max());
-        }
+      for (auto const& c : pa.connectors_) {
+        connectors.push_back(c.pos_);
+        connector_ids.push_back(c.node_);
+        on_ring.push_back(c.on_ring_ ? 1 : 0);
       }
+      n_boundary_connectors += pa.counts_.n_boundary_;
+      n_restricted_connectors += pa.counts_.n_restricted_;
+      n_interior_connectors += pa.counts_.n_interior_;
+      n_rejected_interior += pa.counts_.n_rejected_interior_;
 
-      // Stairs, lifts and footway stubs that end inside the area instead of on
-      // its edge. These carry no ring node, so nothing above can see them.
-      for (auto const& le : loose_by_area[area_i]) {
-        if (!a.levels_.matches_spatially(le.levels_, g_strict_levels)) {
-          ++n_rejected_interior;
-          continue;
-        }
-        auto const duplicate =
-            std::ranges::any_of(connectors, [&](geo::latlng const& c) {
-              return geo::distance(c, le.pos_) < 0.5;
-            });
-        if (duplicate) {
-          continue;
-        }
-        ++n_interior_connectors;
-        connector_ids.push_back(le.id_);
-        on_ring.push_back(0);
-        connectors.push_back(le.pos_);
-        outer_pos.push_back(std::numeric_limits<std::size_t>::max());
-      }
-
-      if (connectors.size() < 2U) {
+      if (pa.status_ == osr::area_status::kTooFewConnectors) {
         ++n_no_crossing;
+        dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                  "too_few_connectors");
         continue;
       }
       // Epstein & Sack's counting/sampling DP is defined over subpolygons
       // P(i,j) of a SIMPLE polygon, so it does not survive holes - and every
-      // barrier and building we just added is a hole.
+      // barrier and building is a hole.
+      auto const& buildings = data.buildings_[area_i];
       n_no_inner_rings += a.rings_.size() == 1U ? 1 : 0;
       n_simple_polygon +=
-          (a.rings_.size() == 1U && linear.barriers_[area_i].empty() &&
-           linear.buildings_[area_i].empty())
-              ? 1
-              : 0;
-
-      auto const& barriers = linear.barriers_[area_i];
-      auto const& buildings = linear.buildings_[area_i];
+          (a.rings_.size() == 1U && barriers.empty() && buildings.empty()) ? 1
+                                                                          : 0;
       if (!barriers.empty()) {
         ++n_areas_with_barrier;
         n_barrier_edges += static_cast<int>(barriers.size());
@@ -2110,69 +1813,42 @@ int main(int argc, char** argv) {
         n_buildings_inside += static_cast<int>(buildings.size());
       }
 
-      // A building overlapping the area that was never mapped as an inner ring
-      // is still a building: routing has to go round it, so it becomes a hole.
-      for (auto const& b : buildings) {
-        rings.push_back(b);
-        n_vertices += b.size();
-      }
-      for (auto const& b : barriers) {
-        n_vertices += b.size();
-      }
-
-      if (n_vertices + connectors.size() > kMaxVertices) {
+      auto const n_vertices = pa.n_vertices_;
+      if (pa.status_ == osr::area_status::kTooBig) {
         ++n_too_big;
         big_vertex_counts.push_back(static_cast<double>(n_vertices));
+        dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                  "too_big");
         continue;
       }
 
       // Stage 1 (the binary): are any ways mapped into this area at all?
-      auto const has_interior_ways = !linear.interior_edges_[area_i].empty();
+      auto const has_interior_ways = !data.interior_edges_[area_i].empty();
       n_no_interior_ways += has_interior_ways ? 0 : 1;
 
-      // What the router can already do here: the area's own ring ways, plus
-      // any linear way lying inside it.
-      auto const network = network_distances(a, linear.interior_edges_[area_i],
-                                             linear.node_pos_, connector_ids);
-
-      // Stage 2, cheap half. The geodesic is never shorter than the straight
-      // line, so network/straight_line <= T implies network/geodesic <= T.
-      // Where that holds for every pair, the area is provably already served
-      // and the O(n^3) visibility graph never has to be built for it.
-      auto cheap_served = true;
-      for (auto i = std::size_t{0U}; i != connectors.size() && cheap_served;
-           ++i) {
-        for (auto j = i + 1U; j != connectors.size() && cheap_served; ++j) {
-          if (on_ring[i] == 0 || on_ring[j] == 0) {
-            continue;
-          }
-          auto const straight = geo::distance(connectors[i], connectors[j]);
-          if (straight < 1.0) {
-            continue;
-          }
-          cheap_served =
-              network[i * connectors.size() + j] <= kServedRatio * straight;
-        }
-      }
+      // The shortcut that needs no geometry (layer 1). Counted only: the
+      // geodesics are built for every area anyway.
+      auto const cheap_served = pa.served_without_geometry_;
       n_cheap_served += cheap_served ? 1 : 0;
       // An area with no ways mapped into it can still be adequately served by
       // its own ring - two adjacent entrances, or a thin shape. Sending it
       // straight to subdivision on the binary alone would be wasted work.
       n_no_ways_but_served += (!has_interior_ways && cheap_served) ? 1 : 0;
 
-      auto const g = osr::area_geodesics{rings, connectors, barriers};
+      auto const& g = *pa.geodesics_;
 
       auto all = std::vector<std::size_t>(connectors.size());
       for (auto i = std::size_t{0U}; i != all.size(); ++i) {
         all[i] = i;
       }
       auto const s = compute_pair_stats(g, all);
-      if (s.n_pairs_ == 0U) {
+      if (pa.status_ == osr::area_status::kNoCrossing) {
         ++n_no_crossing;
+        dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                  "no_crossing");
         continue;
       }
 
-      auto const arc = ring_arc_lengths(outer);
       auto const grouped = group_connectors(connectors);
       auto const sg = compute_pair_stats(g, grouped);
 
@@ -2189,77 +1865,45 @@ int main(int argc, char** argv) {
                                 ? 0.0
                                 : star_max_error(g, all, star_fit(g, all)));
 
-      // A pair the perimeter already serves at near-optimal cost does not
-      // need the area edge at all - the ring ways stay in the graph either
-      // way. Only pairs the crossing actually shortens have to be modelled,
-      // and those are the ones the flat cost should be judged on.
       auto const n_c = connectors.size();
-      auto relevant = std::vector<bool>(n_c * n_c, true);
-      for (auto i = std::size_t{0U}; i != n_c; ++i) {
-        for (auto j = i + 1U; j != n_c; ++j) {
-          auto const d = g.distance(i, j);
-          if (d == osr::area_geodesics::kUnreachable || d < 1.0 ||
-              outer_pos[i] == std::numeric_limits<std::size_t>::max() ||
-              outer_pos[j] == std::numeric_limits<std::size_t>::max()) {
-            continue;
-          }
-          auto const ratio =
-              perimeter_distance(arc, outer_pos[i], outer_pos[j]) / d;
-          detours.push_back(ratio);
-          if (ratio < kRelevantDetour) {
-            relevant[i * n_c + j] = relevant[j * n_c + i] = false;
-          }
-        }
-      }
+      auto const& geo_dist = pa.geodesic_distances_;
 
-      // How well the existing ways already serve the pairs that matter.
-      //
-      // Only boundary-to-boundary pairs can answer this: those are joined by
-      // the ring whatever else is there, so a bad ratio means the interior is
-      // genuinely unserved rather than merely outside the subgraph. An
-      // interior stub's one edge leaves the area and is not in the subgraph at
-      // all, so its distances would all be infinite and say nothing about the
-      // area. Stubs are counted separately instead - one that cannot be
-      // reached over existing ways is itself a reason to mesh.
-      auto worst_network_ratio = 0.0;
-      auto n_relevant = 0;
-      for (auto i = std::size_t{0U}; i != n_c; ++i) {
-        for (auto j = i + 1U; j != n_c; ++j) {
-          auto const d = g.distance(i, j);
-          if (!relevant[i * n_c + j] ||
-              d == osr::area_geodesics::kUnreachable || d < 1.0) {
-            continue;
-          }
-          if (on_ring[i] == 0 || on_ring[j] == 0) {
-            continue;
-          }
-          ++n_relevant;
-          auto const r = network[i * n_c + j] / static_cast<double>(d);
-          network_ratios.push_back(std::min(r, 1000.0));
-          worst_network_ratio = std::max(worst_network_ratio, r);
-        }
-      }
+      // Only pairs a crossing actually shortens have to be modelled, and
+      // those are the ones the model is judged on (layer 1).
+      detours.insert(end(detours), begin(pa.relevance_.outline_detours_),
+                     end(pa.relevance_.outline_detours_));
+      auto const& relevant = pa.relevance_.relevant_;
 
-      auto stranded = 0;
-      for (auto i = std::size_t{0U}; i != n_c; ++i) {
-        if (on_ring[i] != 0) {
-          continue;
-        }
-        auto reachable = false;
-        for (auto j = 0U; j != n_c && !reachable; ++j) {
-          reachable = i != j && std::isfinite(network[i * n_c + j]);
-        }
-        stranded += reachable ? 0 : 1;
+      // Layer 1's verdict: served where every relevant pair of ring
+      // connectors is within max_detour_ of its shortest walk over mapped
+      // ways, and no interior connector is stranded.
+      auto const& verdict = pa.verdict_;
+      for (auto const d : verdict.detours_) {
+        network_ratios.push_back(std::min(d, 1000.0));
       }
-      n_stranded_connectors += stranded;
-      n_areas_with_stranded += stranded != 0 ? 1 : 0;
-
-      if (n_relevant != 0) {
-        worst_network.push_back(std::min(worst_network_ratio, 1000.0));
+      n_stranded_connectors += static_cast<int>(verdict.n_stranded_);
+      n_areas_with_stranded += verdict.n_stranded_ != 0U ? 1 : 0;
+      if (verdict.n_relevant_ != 0U) {
+        worst_network.push_back(std::min(verdict.worst_detour_, 1000.0));
       }
       // Stays index-aligned with spreads_relevant below.
-      needs_mesh.push_back(
-          (worst_network_ratio > kServedRatio || stranded != 0) ? 1 : 0);
+      needs_mesh.push_back(verdict.served_ ? 0 : 1);
+
+      switch (pa.status_) {
+        case osr::area_status::kServed:
+          dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                    "served");
+          break;
+        case osr::area_status::kMeshed:
+          dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                    "meshed", &*pa.cells_, &geo_dist, &pa.regions_);
+          break;
+        case osr::area_status::kUnreachable:
+          dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
+                    "unreachable_pair");
+          break;
+        default: break;
+      }
 
       auto const sr = compute_pair_stats(g, all, &relevant, n_c);
       if (sr.n_pairs_ != 0U) {
@@ -2589,6 +2233,12 @@ int main(int argc, char** argv) {
               auto pts_f = connectors;
               pts_f.insert(end(pts_f), begin(portals_f), end(portals_f));
               {
+                auto dist_m = std::vector<float>(n_c * n_c);
+                for (auto i = std::size_t{0U}; i != n_c; ++i) {
+                  for (auto j = std::size_t{0U}; j != n_c; ++j) {
+                    dist_m[i * n_c + j] = g.distance(i, j);
+                  }
+                }
                 for (auto const t : {10.0, 20.0, 40.0}) {
                   reset_expanded(root_f);
                   auto cells_f = std::vector<std::vector<std::size_t>>{};
@@ -2615,6 +2265,46 @@ int main(int argc, char** argv) {
                       break;
                     }
                   }
+
+                  // The library must reproduce this area exactly: same cells,
+                  // same error for every pair (up to float storage of costs).
+                  auto const lib = run_library(connectors, dist_m, relevant, t);
+                  auto const old_ok = !res.samples_.empty();
+                  auto const lib_ok = lib.has_value() && !lib->errors_.empty();
+                  auto max_diff = 0.0;
+                  // Where the old code gives up on an unreachable pair, the
+                  // library meshes the reachable parts: nothing to compare.
+                  auto same = !old_ok || lib_ok;
+                  lib_extra += (!old_ok && lib_ok) ? 1 : 0;
+                  if (old_ok && lib_ok) {
+                    same = lib->n_cells_ == cells_f.size() &&
+                           lib->errors_.size() == res.samples_.size();
+                    for (auto i = std::size_t{0U};
+                         same && i != res.samples_.size(); ++i) {
+                      max_diff = std::max(
+                          max_diff,
+                          std::abs(lib->errors_[i] - res.samples_[i].error_));
+                    }
+                    same = same && max_diff <= 1e-2;
+                  }
+                  ++lib_compared;
+                  if (!same) {
+                    if (++lib_mismatches <= 10) {
+                      fmt::print(stderr,
+                                 "library mismatch: area {} T={} cells {} vs "
+                                 "{}, pairs {} vs {}, max diff {}\n",
+                                 a.id_, t, cells_f.size(),
+                                 lib ? lib->n_cells_ : 0U, res.samples_.size(),
+                                 lib ? lib->errors_.size() : 0U, max_diff);
+                    }
+                  }
+                  if (old_ok && lib_ok) {
+                    lib_cells[t].push_back(static_cast<double>(lib->n_cells_));
+                    for (auto const e : lib->errors_) {
+                      lib_route_err[t].push_back(e);
+                    }
+                  }
+
                   if (res.samples_.empty()) {
                     continue;
                   }
@@ -2765,6 +2455,10 @@ int main(int argc, char** argv) {
                                   n_vertices, connectors.size(), a.name_});
     }
 
+    if (cells_out.has_value()) {
+      dump.write(*cells_out);
+    }
+
     fmt::print(
         "areas with a crossing: {}   (skipped, <2 usable connectors: {})\n",
         n_reported, n_no_crossing);
@@ -2773,14 +2467,14 @@ int main(int argc, char** argv) {
                                  "connectors)"
                                : "permissive (untagged joins anything)");
     fmt::print("  level tags: {}/{} areas, {}/{} linear ways\n",
-               collector.n_with_level_, collector.areas_.size(),
-               linear.n_with_level_, linear.n_ways_);
+               data.n_areas_with_level_, data.areas_.size(),
+               data.n_ways_with_level_, data.n_ways_);
     if (n_too_big != 0) {
       auto const p = quantiles_of(big_vertex_counts);
       fmt::print(
           "  declined, over {} vertices: {} areas "
           "(p50 {:.0f}, max {:.0f} vertices)\n",
-          kMaxVertices, n_too_big, p.p50_, p.max_);
+          g_max_vertices, n_too_big, p.p50_, p.max_);
     }
     fmt::print(
         "  connectors: {} on the boundary, {} interior "
@@ -2832,11 +2526,11 @@ int main(int argc, char** argv) {
     fmt::print(
         "  access-restricted connectors dropped: {} (from {} restricted linear "
         "ways)\n",
-        n_restricted_connectors, linear.n_restricted_ways_);
+        n_restricted_connectors, data.n_restricted_ways_);
     fmt::print(
         "  rejected by layer (bridge over / tunnel under, no shared "
         "node): {} interior edges, {} interior connectors\n",
-        linear.n_rejected_edges_, n_rejected_interior);
+        data.n_rejected_edges_, n_rejected_interior);
     fmt::print("  no ways mapped into the area at all: {} areas\n",
                n_no_interior_ways);
     fmt::print(
@@ -2956,6 +2650,22 @@ int main(int argc, char** argv) {
       }
       auto const cq = quantiles_of(cells);
       auto const rq = quantiles_of(rf_route_err[t]);
+      fmt::print(
+          "    T={:4.0f}m: cells/area p50 {:4.0f} p90 {:4.0f} max {:4.0f}"
+          " | route err p50 {:6.1f} p90 {:6.1f} p95 {:6.1f}\n",
+          t, cq.p50_, cq.p90_, cq.max_, rq.p50_, rq.p90_, rq.p95_);
+    }
+
+    fmt::print(
+        "  same model via osr::build_area_cells (no portals, one fit) - "
+        "{} area/T runs, {} mismatches, {} meshed only by the library:\n",
+        lib_compared, lib_mismatches, lib_extra);
+    for (auto const& [t, cells] : lib_cells) {
+      if (cells.empty()) {
+        continue;
+      }
+      auto const cq = quantiles_of(cells);
+      auto const rq = quantiles_of(lib_route_err[t]);
       fmt::print(
           "    T={:4.0f}m: cells/area p50 {:4.0f} p90 {:4.0f} max {:4.0f}"
           " | route err p50 {:6.1f} p90 {:6.1f} p95 {:6.1f}\n",

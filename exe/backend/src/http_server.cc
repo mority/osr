@@ -1,5 +1,7 @@
 #include "osr/backend/http_server.h"
 
+#include <fstream>
+#include <sstream>
 #include <utility>
 
 #include "boost/algorithm/string.hpp"
@@ -18,6 +20,7 @@
 #include "net/web_server/serve_static.h"
 #include "net/web_server/web_server.h"
 
+#include "osr/backend/area_routing.h"
 #include "osr/geojson.h"
 #include "osr/lookup.h"
 #include "osr/routing/algorithms.h"
@@ -82,7 +85,8 @@ struct http_server::impl {
        lookup const& l,
        platforms const* pl,
        elevation_storage const* elevations,
-       std::string const& static_file_path)
+       std::string const& static_file_path,
+       fs::path const& area_cells_file)
       : ioc_{ios},
         thread_pool_{thread_pool},
         w_{g},
@@ -98,6 +102,80 @@ struct http_server::impl {
     } catch (fs::filesystem_error const& e) {
       throw utl::fail("static file directory not found: {}", e.what());
     }
+    load_areas(area_cells_file);
+  }
+
+  // Area cells as written by `osr-area-stats --cells-out`, grouped by area so
+  // a request returns whole areas: every feature carries its area's "osm" id.
+  void load_areas(fs::path const& p) {
+    if (p.empty() || !fs::exists(p)) {
+      return;
+    }
+    auto const content = [&]() {
+      auto in = std::ifstream{p};
+      auto ss = std::stringstream{};
+      ss << in.rdbuf();
+      return ss.str();
+    }();
+
+    auto by_osm = hash_map<std::string, std::size_t>{};
+    auto const extend = [](auto&& self, geo::box& b,
+                           json::value const& c) -> void {
+      auto const& a = c.as_array();
+      if (a.size() >= 2U && a[0].is_number()) {
+        b.extend(geo::latlng{a[1].to_number<double>(),
+                             a[0].to_number<double>()});
+      } else {
+        for (auto const& x : a) {
+          self(self, b, x);
+        }
+      }
+    };
+    // Named, not iterated as a temporary: a range-for only extends the
+    // lifetime of the last temporary in its range expression, so the parsed
+    // document would be gone before the first iteration.
+    auto doc = json::parse(content);
+    area_routing_ = std::make_unique<area_routing>(
+        w_, doc.as_object().at("features").as_array());
+    std::cout << "area routing: " << area_routing_->n_areas() << " areas, "
+              << area_routing_->n_hubs() << " hubs, "
+              << area_routing_->n_connectors_ << " connectors, of which "
+              << area_routing_->n_without_routing_node_
+              << " are no routing node (left out)\n";
+    for (auto& f : doc.as_object().at("features").as_array()) {
+      auto const osm = std::string{
+          f.as_object().at("properties").as_object().at("osm").as_string()};
+      auto const [it, inserted] = by_osm.emplace(osm, areas_.size());
+      if (inserted) {
+        areas_.emplace_back();
+      }
+      auto& area = areas_[it->second];
+      extend(extend, area.bbox_,
+             f.as_object().at("geometry").as_object().at("coordinates"));
+      area.features_.emplace_back(std::move(f));
+    }
+    std::cout << "loaded " << areas_.size() << " areas with cells from " << p
+              << '\n';
+  }
+
+  void handle_areas(web_server::http_req_t const& req,
+                    web_server::http_res_cb_t const& cb) {
+    auto const query = boost::json::parse(req.body()).as_object();
+    auto const waypoints = query.at("waypoints").as_array();
+    auto const view = geo::box{
+        geo::latlng{waypoints[1].as_double(), waypoints[0].as_double()},
+        geo::latlng{waypoints[3].as_double(), waypoints[2].as_double()}};
+    auto features = json::array{};
+    for (auto const& a : areas_) {
+      if (a.bbox_.overlaps(view)) {
+        for (auto const& f : a.features_) {
+          features.push_back(f);
+        }
+      }
+    }
+    cb(json_response(req, json::serialize(json::object{
+                              {"type", "FeatureCollection"},
+                              {"features", std::move(features)}})));
   }
 
   static search_profile get_search_profile_from_request(
@@ -140,11 +218,20 @@ struct http_server::impl {
                                                       foot_speed_result.value()}
             : get_parameters(profile);
 
+    // Walking profiles cross areas through their cells.
+    auto const areas =
+        area_routing_ != nullptr && !area_routing_->empty() &&
+                (profile == search_profile::kFoot ||
+                 profile == search_profile::kWheelchair)
+            ? std::optional{area_routing_->sharing()}
+            : std::nullopt;
+    auto const* sharing = areas.has_value() ? &*areas : nullptr;
+
     auto const p = route(params, w_, l_, profile, from, to, max, dir, 100,
-                         nullptr, nullptr, elevations_, routing_algo);
+                         nullptr, sharing, elevations_, routing_algo);
 
     auto const p1 = route(params, w_, l_, profile, from, std::vector{to}, max,
-                          dir, 100, nullptr, nullptr, elevations_);
+                          dir, 100, nullptr, sharing, elevations_);
 
     auto const print = [](char const* name, std::optional<path> const& p) {
       if (p.has_value()) {
@@ -161,7 +248,40 @@ struct http_server::impl {
                        http::status::not_found));
       return;
     }
-    cb(json_response(req, to_featurecollection(w_, p)));
+    // Both the path as routed - an area crossing as straight lines through
+    // the hubs of its cells, marked "area" - and, marked "geodesic", the
+    // shortest walkable line each crossing stands for.
+    auto fc = to_featurecollection_value(w_, p);
+    if (sharing != nullptr) {
+      auto& features = fc.at("features").as_array();
+      for (auto i = std::size_t{0U}; i != p->segments_.size(); ++i) {
+        auto const& s = p->segments_[i];
+        if (sharing->is_additional_node(s.from_) ||
+            sharing->is_additional_node(s.to_)) {
+          auto& props = features[i].as_object()["properties"].as_object();
+          props["area"] = true;
+          // Path reconstruction puts every segment without a way on level
+          // 0; an area's segments are on its floor.
+          props["level"] =
+              area_routing_
+                  ->level_of(sharing->is_additional_node(s.to_) ? s.to_
+                                                                : s.from_)
+                  .to_float();
+        }
+      }
+      for (auto const& c : area_routing_->crossings(*p)) {
+        features.push_back(json::object{
+            {"type", "Feature"},
+            {"properties",
+             {{"geodesic", true},
+              {"level", c.level_.to_float()},
+              {"area_osm", area_routing_->osm_of(c.area_)},
+              {"model_distance", c.model_distance_},
+              {"geodesic_distance", c.geodesic_distance_}}},
+            {"geometry", to_line_string(c.geodesic_)}});
+      }
+    }
+    cb(json_response(req, json::serialize(fc)));
   }
 
   void handle_levels(web_server::http_req_t const& req,
@@ -277,6 +397,13 @@ struct http_server::impl {
                 handle_graph(req1, cb1);
               },
               req, cb);
+        } else if (target.starts_with("/api/areas")) {
+          return run_parallel(
+              [this](web_server::http_req_t const& req1,
+                     web_server::http_res_cb_t const& cb1) {
+                handle_areas(req1, cb1);
+              },
+              req, cb);
         } else if (target.starts_with("/api/platforms")) {
           return run_parallel(
               [this](web_server::http_req_t const& req1,
@@ -355,6 +482,14 @@ private:
   lookup const& l_;
   platforms const* pl_;
   elevation_storage const* elevations_;
+
+  struct area_features {
+    geo::box bbox_;
+    json::array features_;
+  };
+  std::vector<area_features> areas_;
+  std::unique_ptr<area_routing> area_routing_;
+
   web_server server_;
   bool serve_static_files_{false};
   std::string static_file_path_;
@@ -366,9 +501,16 @@ http_server::http_server(boost::asio::io_context& ioc,
                          lookup const& l,
                          platforms const* pl,
                          elevation_storage const* elevation,
-                         std::string const& static_file_path)
-    : impl_{new impl(ioc, thread_pool, w, l, pl, elevation, static_file_path)} {
-}
+                         std::string const& static_file_path,
+                         fs::path const& area_cells_file)
+    : impl_{new impl(ioc,
+                     thread_pool,
+                     w,
+                     l,
+                     pl,
+                     elevation,
+                     static_file_path,
+                     area_cells_file)} {}
 
 http_server::~http_server() = default;
 

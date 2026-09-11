@@ -18,7 +18,10 @@ struct elevator_tracking {
              way_idx_t,
              node_idx_t const n,
              bool) {
-    uses_elevator_ = l.uses_elevator_ || r.node_properties_[n].is_elevator();
+    // Additional nodes (see sharing_data) have no properties to look up.
+    uses_elevator_ =
+        l.uses_elevator_ || (to_idx(n) < r.node_properties_.size() &&
+                             r.node_properties_[n].is_elevator());
   }
 
   bool uses_elevator_{false};

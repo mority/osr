@@ -5,3 +5,5 @@
 /.clang-tidy
 /.vs
 /out
+# map fonts, copied from motis ui/static/glyphs (68MB)
+/web/glyphs

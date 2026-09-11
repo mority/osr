@@ -59,6 +59,10 @@ struct sharing_data {
   node_idx_t::value_t additional_node_offset_{};
   std::vector<geo::latlng> const& additional_node_coordinates_;
   hash_map<node_idx_t, std::vector<additional_edge>> const& additional_edges_;
+
+  // Optional: the floor each additional node is on, kNoLevel for any. The
+  // foot profile steps onto an additional node on its own floor only.
+  std::vector<level_t> const* additional_node_levels_{nullptr};
 };
 
 inline bool is_allowed(bitvec<node_idx_t> const* b, node_idx_t const n) {

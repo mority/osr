@@ -7,9 +7,8 @@
     <meta charset='utf-8'>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel='stylesheet'
-          href='https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.css'/>
-    <script src='https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.js'></script>
-    <script src="https://unpkg.com/maplibre-contour@0.0.5/dist/index.min.js"></script>
+          href='https://unpkg.com/maplibre-gl@5.17.0/dist/maplibre-gl.css'/>
+    <script src='https://unpkg.com/maplibre-gl@5.17.0/dist/maplibre-gl.js'></script>
     <style>
         body {
             margin: 0;
@@ -28,7 +27,7 @@
             width: 100%;
         }
 
-        #graph-toggle {
+        #graph-toggle, #area-toggle {
             position: relative;
             top: 5px;
             left: 5px;
@@ -46,6 +45,10 @@
             text-decoration: none;
             color: black;
             margin-bottom: 16px;
+        }
+
+        #graph-toggle {
+            margin-bottom: 4px;
         }
 
         .level {
@@ -73,7 +76,7 @@
             background: #8fff7b;
         }
 
-        #graph-toggle:hover, .level:hover {
+        #graph-toggle:hover, #area-toggle:hover, .level:hover {
             background: #EEE;
         }
 
@@ -124,14 +127,15 @@
 </head>
 <body>
 <a id="graph-toggle" href="#" onclick="toggleGraph()">G</a>
+<a id="area-toggle" href="#" onclick="toggleAreas()" title="area cells">A</a>
 <div id="levels"></div>
 <select id="profile" onchange="selectProfile(event)">
-    <option value="foot">foot</option>
+    <option value="foot" selected>foot</option>
     <option value="wheelchair">wheelchair</option>
     <option value="bike">bike</option>
     <option value="bike_elevation_low">bike (low elevation)</option>
     <option value="bike_elevation_high">bike (high elevation)</option>
-    <option value="car" selected>car</option>
+    <option value="car">car</option>
 </select>
 <select id="direction" onchange="selectDirection(event)">
     <option value="forward" selected>forward</option>
@@ -150,8 +154,12 @@
 <script type="module">
     import {style} from "./style.js";
 
-    const start = [8.65749737, 50.10416625]
-    const destination = [8.65750757, 50.10417645];
+    // Across Alexanderplatz, Berlin (way 783052052, the ground-level plaza):
+    // its two boundary connectors furthest apart, so the default route has
+    // an area to cross and the area's cells show at the default level 0.
+    const start = [13.4137686, 52.5201457];
+    const destination = [13.4121666, 52.523808];
+    const initialCenter = [13.4131949, 52.5219785];
     const query = {
         start, destination,
         max: 14400,
@@ -175,18 +183,13 @@
 
     const map = new maplibregl.Map({
         container: 'map',
-        center: start,
+        center: initialCenter,
         style: {
             version: 8,
             sources: {},
             layers: [],
         },
-        zoom: 18,
-        transformRequest: (url, resourceType) => {
-            if (url.startsWith('/')) {
-                return {url: `https://europe.motis-project.de/tiles${url}`}
-            }
-        }
+        zoom: 18 // level buttons only appear from zoom 18 on
     });
 
     const toTable = (properties) => {
@@ -329,6 +332,7 @@
             style(map, 0);
             await addRouting();
             await updateGraph();
+            await addAreaLayers();
         }
         levelsDom.innerHTML = '';
         levels.forEach(l => {
@@ -342,6 +346,7 @@
                 style(map, l);
                 await addRouting();
                 await updateGraph();
+                await addAreaLayers();
             };
             levelsDom.appendChild(levelLink);
         })
@@ -361,9 +366,10 @@
                 'line-cap': 'round',
             },
             'filter': [
-                'any',
-                ['!has', 'level'],
-                ['==', 'level', currentLevel]
+                'all',
+                ['!has', 'area'],
+                ['!has', 'geodesic'],
+                ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
             ],
             'paint': {
                 'line-color': '#1966a4',
@@ -380,15 +386,43 @@
                 'line-cap': 'round',
             },
             'filter': [
-                'any',
-                ['!has', 'level'],
-                ['==', 'level', currentLevel]
+                'all',
+                ['!has', 'area'],
+                ['!has', 'geodesic'],
+                ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
             ],
             'paint': {
                 'line-color': '#42a5f5',
                 'line-width': 5,
                 'line-opacity': 0.8
             }
+        });
+        // Drawn bottom to top: the route (above), each area crossing as the
+        // shortest walkable line, and on top the crossing as the router took
+        // it - straight lines through the hubs of the cells.
+        map.addLayer({
+            'id': 'path-geodesic',
+            'type': 'line',
+            'source': 'path',
+            'filter': [
+                'all',
+                ['has', 'geodesic'],
+                ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
+            ],
+            'layout': {'line-join': 'round', 'line-cap': 'round'},
+            'paint': {'line-color': '#16a34a', 'line-width': 5, 'line-opacity': 0.85, 'line-dasharray': [2, 1]}
+        });
+        map.addLayer({
+            'id': 'path-area',
+            'type': 'line',
+            'source': 'path',
+            'filter': [
+                'all',
+                ['has', 'area'],
+                ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
+            ],
+            'layout': {'line-join': 'round', 'line-cap': 'round'},
+            'paint': {'line-color': '#dc2626', 'line-width': 4, 'line-dasharray': [0, 2]}
         });
     }
 
@@ -537,6 +571,135 @@
         await updateGraph();
     }
 
+    // Area cells, from osr-area-stats --cells-out <data-dir>/area_cells.geojson
+    const getAreas = async (bounds) => {
+        const response = await fetch(`${window.origin}/api/areas`, {
+            method: 'POST',
+            mode: 'cors',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({waypoints: bounds.toArray().flat()})
+        });
+        return await response.json();
+    };
+
+    const cellColor = [
+        'case', ['has', 'cell'],
+        ['match', ['%', ['get', 'cell'], 8],
+            0, '#e6194b', 1, '#3cb44b', 2, '#4363d8', 3, '#f58231',
+            4, '#911eb4', 5, '#0fa3b1', 6, '#f032e6', 7, '#9a6324',
+            '#777777'],
+        '#777777'
+    ];
+    const statusColor = [
+        'match', ['get', 'status'],
+        'meshed', '#4363d8',
+        'served', '#3cb44b',
+        'too_big', '#e6194b',
+        'unreachable_pair', '#f58231',
+        '#888888'
+    ];
+    const areaLayers = [
+        {
+            id: 'area-fill', type: 'fill', filter: ['==', ['get', 'kind'], 'area'],
+            paint: {'fill-color': statusColor, 'fill-opacity': 0.12}
+        },
+        {
+            id: 'area-outline', type: 'line', filter: ['==', ['get', 'kind'], 'area'],
+            paint: {'line-color': statusColor, 'line-width': 1.5}
+        },
+        {
+            // where the cuts put each cell - drawn for looking, never routed on
+            id: 'area-cell', type: 'fill', filter: ['==', ['get', 'kind'], 'cell'],
+            paint: {'fill-color': cellColor, 'fill-opacity': 0.25}
+        },
+        {
+            id: 'area-cell-outline', type: 'line', filter: ['==', ['get', 'kind'], 'cell'],
+            paint: {'line-color': cellColor, 'line-width': 1.5, 'line-opacity': 0.9}
+        },
+        {
+            id: 'area-barrier', type: 'line', filter: ['==', ['get', 'kind'], 'barrier'],
+            paint: {'line-color': '#222222', 'line-width': 2, 'line-dasharray': [2, 1]}
+        },
+        {
+            id: 'area-spoke', type: 'line', filter: ['==', ['get', 'kind'], 'spoke'],
+            paint: {'line-color': cellColor, 'line-width': 2, 'line-opacity': 0.8}
+        },
+        {
+            id: 'area-neighbour', type: 'line', filter: ['==', ['get', 'kind'], 'neighbour'],
+            paint: {'line-color': '#111111', 'line-width': 3, 'line-dasharray': [1, 1]}
+        },
+        {
+            id: 'area-connector', type: 'circle', filter: ['==', ['get', 'kind'], 'connector'],
+            paint: {
+                'circle-color': cellColor, 'circle-radius': 5,
+                // ringed red: reaches no other connector, so no cell
+                'circle-stroke-color': ['case', ['has', 'unreachable'], '#e6194b', '#ffffff'],
+                'circle-stroke-width': ['case', ['has', 'unreachable'], 2.5, 1]
+            }
+        },
+        {
+            id: 'area-hub', type: 'circle', filter: ['==', ['get', 'kind'], 'hub'],
+            paint: {
+                'circle-color': cellColor, 'circle-radius': 8,
+                'circle-stroke-color': '#111111', 'circle-stroke-width': 2
+            }
+        }
+    ];
+
+    const areaToggle = document.getElementById("area-toggle");
+    let areasActive = false;
+
+    // An area and its cells are shown on the levels it is on. Untagged areas
+    // count as ground level: shown at level 0 only, not on every floor.
+    const onCurrentLevel = () => currentLevel === 0
+        ? ['any', ['!', ['has', 'levels']], ['in', 0, ['get', 'levels']]]
+        : ['all', ['has', 'levels'], ['in', currentLevel, ['get', 'levels']]];
+
+    // Also called after a level change: style() replaces the whole map
+    // style, which drops every source and layer added on top of it - and
+    // re-adding picks up the new level.
+    const addAreaLayers = async () => {
+        if (!areasActive) {
+            return;
+        }
+        if (!map.getSource('areas')) {
+            map.addSource('areas', {type: 'geojson', data: await getAreas(map.getBounds())});
+        }
+        areaLayers.forEach(l => {
+            if (!map.getLayer(l.id)) {
+                map.addLayer({...l, source: 'areas', filter: ['all', l.filter, onCurrentLevel()]});
+            }
+        });
+    };
+
+    window.toggleAreas = async () => {
+        areasActive = !areasActive;
+        if (areasActive) {
+            areaToggle.classList.add('active');
+            await addAreaLayers();
+        } else {
+            areaToggle.classList.remove('active');
+            areaLayers.forEach(l => map.removeLayer(l.id));
+            map.removeSource('areas');
+        }
+    }
+
+    areaLayers.map(l => l.id).forEach((layer) => {
+        map.on('click', layer, (e) => {
+            new maplibregl.Popup()
+                .setLngLat(e.lngLat)
+                .setDOMContent(toTable(e.features[0].properties))
+                .addTo(map);
+            e.originalEvent.stopPropagation();
+        });
+        map.on('mouseenter', layer, () => {
+            map.getCanvas().style.cursor = 'pointer';
+        });
+        map.on('mouseleave', layer, () => {
+            map.getCanvas().style.cursor = '';
+        });
+    });
+
     window.selectProfile = async (e) => {
         query.profile = e.target.value;
         map.getSource('path').setData(await getRoute());
@@ -573,6 +736,9 @@
             map.getSource('graph').setData(await getGraph(map.getBounds()));
             map.getSource('platform').setData(await getPlatforms(map.getBounds()));
         }
+        if (areasActive) {
+            map.getSource('areas').setData(await getAreas(map.getBounds()));
+        }
         updateLevels();
     });
 
@@ -594,31 +760,33 @@
         });
     });
 
+    // Not chained through .on(): since MapLibre 5 it returns a subscription,
+    // not the marker.
     const startMarker = new maplibregl.Marker({
         draggable: true,
         color: 'green'
     })
         .setLngLat(start)
-        .addTo(map)
-        .on('dragend', async () => {
-            const x = startMarker.getLngLat();
-            query.start = [x.lng, x.lat];
-            query.start_level = currentLevel;
-            updateRoute();
-        });
+        .addTo(map);
+    startMarker.on('dragend', async () => {
+        const x = startMarker.getLngLat();
+        query.start = [x.lng, x.lat];
+        query.start_level = currentLevel;
+        updateRoute();
+    });
 
     const destinationMarker = new maplibregl.Marker({
         draggable: true,
         color: 'red'
     })
         .setLngLat(destination)
-        .addTo(map)
-        .on('dragend', async () => {
-            const x = destinationMarker.getLngLat();
-            query.destination = [x.lng, x.lat];
-            query.destination_level = currentLevel;
-            updateRoute();
-        });
+        .addTo(map);
+    destinationMarker.on('dragend', async () => {
+        const x = destinationMarker.getLngLat();
+        query.destination = [x.lng, x.lat];
+        query.destination_level = currentLevel;
+        updateRoute();
+    });
 
     let popup = null;
     map.on('contextmenu', (e) => {

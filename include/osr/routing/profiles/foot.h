@@ -15,9 +15,50 @@ namespace osr {
 
 struct sharing_data;
 
+}  // namespace osr
+
+#include "osr/routing/sharing_data.h"
+
+namespace osr {
+
 template <bool IsWheelchair, typename Tracking = noop_tracking>
 struct foot {
   static constexpr auto const kMaxMatchDistance = 100U;
+
+  // An edge of sharing_data's additional graph - for foot, the edges of area
+  // cells: open ground, walked at the plain walking speed.
+  static constexpr auto const kAdditionalWayProperties =
+      way_properties{.is_foot_accessible_ = true,
+                     .is_bike_accessible_ = false,
+                     .is_car_accessible_ = false,
+                     .is_destination_ = false,
+                     .is_oneway_car_ = false,
+                     .is_oneway_bike_ = false,
+                     .is_elevator_ = false,
+                     .is_steps_ = false,
+                     .speed_limit_ = 0,
+                     .is_platform_ = 0,
+                     .is_parking_ = false,
+                     .is_ramp_ = false,
+                     .is_sidewalk_separate_ = false,
+                     .motor_vehicle_no_ = false,
+                     .from_level_ = 0,
+                     .has_toll_ = false,
+                     .is_big_street_ = false,
+                     .to_level_ = 0,
+                     .is_bus_accessible_ = false,
+                     .in_route_ = false,
+                     .is_railway_accessible_ = false,
+                     .is_oneway_bus_psv_ = false,
+                     .is_incline_down_ = false,
+                     .is_bus_accessible_with_penalty_ = false,
+                     .is_ferry_accessible_ = false,
+                     .is_railway_accessible_with_penalty_ = false,
+                     .has_hgv_info_ = false,
+                     .has_conditionals_ = false,
+                     .is_in_low_emission_zone_ = false,
+                     .is_detour_ = false,
+                     .is_oneway_reverse_ = false};
 
   struct parameters {
     using profile_t = foot<IsWheelchair, Tracking>;
@@ -187,9 +228,55 @@ struct foot {
                        duration_t const current_duration,
                        std::optional<routing_time_t> const start_time,
                        bitvec<node_idx_t> const* blocked,
-                       sharing_data const*,
+                       sharing_data const* sharing,
                        elevation_storage const*,
                        Fn&& fn) {
+    // Additional nodes and edges: for foot, the hubs of area cells, joined to
+    // the connectors of their cell and to neighbouring hubs. The graph is
+    // symmetric, so the same edges serve both search directions.
+    if (sharing != nullptr) {
+      if (auto const it = sharing->additional_edges_.find(n.n_);
+          it != end(sharing->additional_edges_)) {
+        for (auto const& ae : it->second) {
+          // An area on another floor is not entered - a route at street level
+          // must not slip through the station hall underneath.
+          auto target_lvl = n.lvl_;
+          if (sharing->is_additional_node(ae.to_) &&
+              sharing->additional_node_levels_ != nullptr) {
+            auto const hub_lvl = (*sharing->additional_node_levels_)
+                [to_idx(ae.to_) - sharing->additional_node_offset_];
+            if (hub_lvl != kNoLevel) {
+              if (!same_floor(n.lvl_, hub_lvl)) {
+                continue;
+              }
+              target_lvl = hub_lvl;
+            }
+          }
+          if (!sharing->is_additional_node(ae.to_)) {
+            if constexpr (WithBlocked) {
+              if (blocked->test(ae.to_)) {
+                continue;
+              }
+            }
+            if (node_cost(params, w.node_properties_[ae.to_]).cost_ ==
+                kInfeasible) {
+              continue;
+            }
+          }
+          auto const step = way_cost(
+              params, w, timezones, way_idx_t::invalid(),
+              kAdditionalWayProperties, direction::kForward, ae.distance_,
+              start_time, current_duration, SearchDir);
+          fn(node{ae.to_, target_lvl}, step.cost_, step.duration_, ae.distance_,
+             way_idx_t::invalid(), 0U, 0U, elevation_storage::elevation{},
+             false);
+        }
+      }
+      if (sharing->is_additional_node(n.n_)) {
+        return;  // a hub has no ways
+      }
+    }
+
     for (auto const [way, i] :
          utl::zip_unchecked(w.node_ways_[n.n_], w.node_in_way_idx_[n.n_])) {
       auto const expand = [&](direction const way_dir, std::uint16_t const from,
@@ -409,6 +496,14 @@ struct foot {
   }
 
   static constexpr node get_reverse(node const n) { return n; }
+
+  // Untagged counts as the ground floor, as in node's operator==.
+  static constexpr bool same_floor(level_t const a, level_t const b) {
+    auto const is_zero = [](level_t const l) {
+      return l == kNoLevel || l == level_t{0.F};
+    };
+    return a == b || (is_zero(a) && is_zero(b));
+  }
 };
 
 }  // namespace osr
