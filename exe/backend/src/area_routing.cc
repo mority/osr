@@ -51,6 +51,11 @@ area_routing::area_routing(ways const& w, json::array const& features) {
     auto meshed = false;
     auto levels = area_levels{.any_ = true};
     auto neighbours = std::vector<std::pair<std::size_t, std::size_t>>{};
+    // Per-connector costs, if the file has them for every connector (older
+    // files carry only the flat cost per cell).
+    auto spokes = std::vector<float>{};
+    auto link_costs = std::vector<float>{};
+    auto every_spoke = true;
     for (auto const* f : fs) {
       auto const& props = f->at("properties").as_object();
       auto const& coords = f->at("geometry").as_object().at("coordinates");
@@ -78,9 +83,21 @@ area_routing::area_routing(ways const& w, json::array const& features) {
                 props.at("cell").to_number<std::size_t>()));
         in.connector_nodes_.push_back(props.at("node").to_number<std::int64_t>());
         in.connector_pos_.push_back(to_latlng(coords));
+        if (auto const* s = props.if_contains("spoke"); s != nullptr) {
+          spokes.push_back(s->to_number<float>());
+        } else {
+          every_spoke = false;
+        }
       } else if (kind == "neighbour") {
         neighbours.emplace_back(props.at("from").to_number<std::size_t>(),
                                 props.at("to").to_number<std::size_t>());
+        auto const* c = props.if_contains("cost");
+        link_costs.push_back(c != nullptr ? c->to_number<float>() : 0.F);
+      } else if (kind == "direct") {
+        in.cells_.direct_.push_back(
+            {.a_ = props.at("from").to_number<std::uint32_t>(),
+             .b_ = props.at("to").to_number<std::uint32_t>(),
+             .cost_ = props.at("cost").to_number<float>()});
       } else if (kind == "barrier") {
         geo.barriers_.push_back(to_line(coords));
       }
@@ -91,6 +108,15 @@ area_routing::area_routing(ways const& w, json::array const& features) {
     for (auto const& [x, y] : neighbours) {
       in.cells_.set_neighbour(static_cast<area_cells::cell_idx_t>(x),
                               static_cast<area_cells::cell_idx_t>(y));
+    }
+    if (every_spoke && spokes.size() == in.connector_nodes_.size()) {
+      in.cells_.spoke_ = std::move(spokes);
+      for (auto i = std::size_t{0U}; i != neighbours.size(); ++i) {
+        in.cells_.set_link(
+            static_cast<area_cells::cell_idx_t>(neighbours[i].first),
+            static_cast<area_cells::cell_idx_t>(neighbours[i].second),
+            link_costs[i]);
+      }
     }
     in.level_ = area_floor(levels);
     geo.connectors_ = in.connector_pos_;
@@ -105,6 +131,13 @@ area_routing::area_routing(ways const& w, json::array const& features) {
   drawer_ = std::make_unique<crossing_drawer>(*graph_, std::move(geometries));
   n_connectors_ = graph_->n_connectors_;
   n_without_routing_node_ = graph_->n_without_routing_node_;
+
+  // The medial axis of every area, for the comparison the UI draws. Cheap
+  // next to everything else here - all of Berlin's take well under a second.
+  for (auto i = std::size_t{0U}; i != drawer_->n_areas(); ++i) {
+    auto const& g = drawer_->geometry(i);
+    skeletons_.push_back(std::make_unique<area_skeleton>(g.rings_, g.barriers_));
+  }
 }
 
 }  // namespace osr::backend

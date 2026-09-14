@@ -564,7 +564,10 @@ prepared_area prepare_area(area_data const& data,
   pa.cells_ = build_area_cells(
       positions, pa.geodesic_distances_, pa.relevance_.relevant_,
       {.threshold_ = o.cells_threshold_,
-       .rings_ = o.shared_borders_ ? &pa.rings_ : nullptr},
+       .rings_ = o.shared_borders_ ? &pa.rings_ : nullptr,
+       .fit_ = o.cell_fit_,
+       .min_split_ = o.min_split_,
+       .direct_edges_ = o.direct_edges_},
       &pa.regions_);
   pa.status_ = pa.cells_.has_value() ? area_status::kMeshed
                                      : area_status::kUnreachable;

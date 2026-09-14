@@ -27,7 +27,7 @@
             width: 100%;
         }
 
-        #graph-toggle, #area-toggle {
+        #graph-toggle, #area-toggle, #skeleton-toggle {
             position: relative;
             top: 5px;
             left: 5px;
@@ -47,7 +47,7 @@
             margin-bottom: 16px;
         }
 
-        #graph-toggle {
+        #graph-toggle, #area-toggle {
             margin-bottom: 4px;
         }
 
@@ -76,7 +76,7 @@
             background: #8fff7b;
         }
 
-        #graph-toggle:hover, #area-toggle:hover, .level:hover {
+        #graph-toggle:hover, #area-toggle:hover, #skeleton-toggle:hover, .level:hover {
             background: #EEE;
         }
 
@@ -127,7 +127,8 @@
 </head>
 <body>
 <a id="graph-toggle" href="#" onclick="toggleGraph()">G</a>
-<a id="area-toggle" href="#" onclick="toggleAreas()" title="area cells">A</a>
+<a id="area-toggle" href="#" onclick="toggleAreas()" title="Cells">C</a>
+<a id="skeleton-toggle" href="#" onclick="toggleSkeleton()" title="Skeleton">S</a>
 <div id="levels"></div>
 <select id="profile" onchange="selectProfile(event)">
     <option value="foot" selected>foot</option>
@@ -369,6 +370,7 @@
                 'all',
                 ['!has', 'area'],
                 ['!has', 'geodesic'],
+                ['!has', 'skeleton'],
                 ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
             ],
             'paint': {
@@ -389,6 +391,7 @@
                 'all',
                 ['!has', 'area'],
                 ['!has', 'geodesic'],
+                ['!has', 'skeleton'],
                 ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
             ],
             'paint': {
@@ -398,8 +401,9 @@
             }
         });
         // Drawn bottom to top: the route (above), each area crossing as the
-        // shortest walkable line, and on top the crossing as the router took
-        // it - straight lines through the hubs of the cells.
+        // shortest walkable line, then the same crossing over the medial
+        // axis, and on top the crossing as the router took it - straight
+        // lines through the hubs of the cells.
         map.addLayer({
             'id': 'path-geodesic',
             'type': 'line',
@@ -411,6 +415,18 @@
             ],
             'layout': {'line-join': 'round', 'line-cap': 'round'},
             'paint': {'line-color': '#16a34a', 'line-width': 5, 'line-opacity': 0.85, 'line-dasharray': [2, 1]}
+        });
+        map.addLayer({
+            'id': 'path-skeleton',
+            'type': 'line',
+            'source': 'path',
+            'filter': [
+                'all',
+                ['has', 'skeleton'],
+                ['any', ['!has', 'level'], ['==', 'level', currentLevel]]
+            ],
+            'layout': {'line-join': 'round', 'line-cap': 'round'},
+            'paint': {'line-color': '#7c3aed', 'line-width': 4, 'line-opacity': 0.85, 'line-dasharray': [4, 2]}
         });
         map.addLayer({
             'id': 'path-area',
@@ -646,8 +662,19 @@
         }
     ];
 
+    // The medial axis of the same areas (osr/area/skeleton.h): the other way
+    // of crossing them, on its own toggle.
+    const skeletonLayers = [
+        {
+            id: 'area-skeleton', type: 'line', filter: ['==', ['get', 'kind'], 'skeleton'],
+            paint: {'line-color': '#7c3aed', 'line-width': 2, 'line-opacity': 0.9}
+        }
+    ];
+
     const areaToggle = document.getElementById("area-toggle");
+    const skeletonToggle = document.getElementById("skeleton-toggle");
     let areasActive = false;
+    let skeletonActive = false;
 
     // An area and its cells are shown on the levels it is on. Untagged areas
     // count as ground level: shown at level 0 only, not on every floor.
@@ -655,36 +682,64 @@
         ? ['any', ['!', ['has', 'levels']], ['in', 0, ['get', 'levels']]]
         : ['all', ['has', 'levels'], ['in', currentLevel, ['get', 'levels']]];
 
-    // Also called after a level change: style() replaces the whole map
-    // style, which drops every source and layer added on top of it - and
-    // re-adding picks up the new level.
-    const addAreaLayers = async () => {
-        if (!areasActive) {
-            return;
-        }
+    // Both toggles draw from the one source: /api/areas answers with the
+    // cells and the skeleton of every area in view.
+    const addLayers = async (layers) => {
         if (!map.getSource('areas')) {
             map.addSource('areas', {type: 'geojson', data: await getAreas(map.getBounds())});
         }
-        areaLayers.forEach(l => {
+        layers.forEach(l => {
             if (!map.getLayer(l.id)) {
                 map.addLayer({...l, source: 'areas', filter: ['all', l.filter, onCurrentLevel()]});
             }
         });
     };
 
+    // The source goes only once nothing is drawn from it any more.
+    const removeLayers = (layers) => {
+        layers.forEach(l => {
+            if (map.getLayer(l.id)) {
+                map.removeLayer(l.id);
+            }
+        });
+        if (!areasActive && !skeletonActive && map.getSource('areas')) {
+            map.removeSource('areas');
+        }
+    };
+
+    // Also called after a level change: style() replaces the whole map
+    // style, which drops every source and layer added on top of it - and
+    // re-adding picks up the new level.
+    const addAreaLayers = async () => {
+        if (areasActive) {
+            await addLayers(areaLayers);
+        }
+        if (skeletonActive) {
+            await addLayers(skeletonLayers);
+        }
+    };
+
     window.toggleAreas = async () => {
         areasActive = !areasActive;
+        areaToggle.classList.toggle('active', areasActive);
         if (areasActive) {
-            areaToggle.classList.add('active');
-            await addAreaLayers();
+            await addLayers(areaLayers);
         } else {
-            areaToggle.classList.remove('active');
-            areaLayers.forEach(l => map.removeLayer(l.id));
-            map.removeSource('areas');
+            removeLayers(areaLayers);
         }
     }
 
-    areaLayers.map(l => l.id).forEach((layer) => {
+    window.toggleSkeleton = async () => {
+        skeletonActive = !skeletonActive;
+        skeletonToggle.classList.toggle('active', skeletonActive);
+        if (skeletonActive) {
+            await addLayers(skeletonLayers);
+        } else {
+            removeLayers(skeletonLayers);
+        }
+    }
+
+    [...areaLayers, ...skeletonLayers].map(l => l.id).forEach((layer) => {
         map.on('click', layer, (e) => {
             new maplibregl.Popup()
                 .setLngLat(e.lngLat)

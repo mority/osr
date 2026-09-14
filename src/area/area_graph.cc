@@ -43,8 +43,8 @@ area_graph::area_graph(node_idx_t::value_t const first_hub,
       return node_idx_t{
           static_cast<node_idx_t::value_t>(first_hub_ + first + cell)};
     };
-    auto const half = [](double const x) {
-      return static_cast<distance_t>(std::lround(x / 2.0));
+    auto const meters = [](double const x) {
+      return static_cast<distance_t>(std::lround(x));
     };
     auto const link = [&](node_idx_t const x, node_idx_t const y,
                           distance_t const d) {
@@ -52,7 +52,6 @@ area_graph::area_graph(node_idx_t::value_t const first_hub,
       edges_[y].push_back(additional_edge{.to_ = x, .distance_ = d});
     };
 
-    auto const& cost = a.cells_.cost_;
     for (auto i = std::size_t{0U}; i != a.connector_nodes_.size(); ++i) {
       auto const cell = a.cells_.connector_cell_[i];
       if (cell == area_cells::kNoCell) {
@@ -65,14 +64,23 @@ area_graph::area_graph(node_idx_t::value_t const first_hub,
         continue;
       }
       if (connector_of.emplace(*n, i).second) {
-        link(*n, hub(cell), half(cost[cell]));
+        link(*n, hub(cell), meters(a.cells_.spoke_cost(i)));
+      }
+    }
+    // The pairs kept exactly, as an edge between the two connectors.
+    for (auto const& d : a.cells_.direct_) {
+      auto const from = lookup(a.connector_nodes_[d.a_]);
+      auto const to = lookup(a.connector_nodes_[d.b_]);
+      if (from.has_value() && to.has_value() && *from != *to) {
+        link(*from, *to, meters(d.cost_));
       }
     }
     for (auto x = std::size_t{0U}; x != a.cells_.n_cells(); ++x) {
       for (auto y = x + 1U; y != a.cells_.n_cells(); ++y) {
-        if (a.cells_.is_neighbour(static_cast<area_cells::cell_idx_t>(x),
-                                  static_cast<area_cells::cell_idx_t>(y))) {
-          link(hub(x), hub(y), half(cost[x] + cost[y]));
+        auto const cx = static_cast<area_cells::cell_idx_t>(x);
+        auto const cy = static_cast<area_cells::cell_idx_t>(y);
+        if (a.cells_.is_neighbour(cx, cy)) {
+          link(hub(x), hub(y), meters(a.cells_.link_cost(cx, cy)));
         }
       }
     }

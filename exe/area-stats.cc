@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -40,6 +41,10 @@
 // harness take .osm files too.
 #include "osmium/io/xml_input.hpp"
 #include "osmium/osm/types.hpp"
+
+#include "boost/polygon/point_data.hpp"
+#include "boost/polygon/segment_data.hpp"
+#include "boost/polygon/voronoi.hpp"
 
 #include "geo/box.h"
 #include "geo/latlng.h"
@@ -78,6 +83,32 @@ bool g_interior_ways = true;
 // Cells neighbour where their regions share a border, unless this is set
 // (--tree-neighbours): then each cut joins just one pair, as it used to.
 bool g_tree_neighbours = false;
+
+// Build every visibility graph with both algorithms and compare them edge for
+// edge (--check-visibility): they share their geometric tests, so any
+// difference is a bug in one of them. Also times both.
+bool g_check_visibility = false;
+
+// Fit the cell costs so no crossing is priced below its geodesic
+// (--no-underpricing), instead of by least squares. See osr::cost_fit.
+bool g_no_underpricing = false;
+
+// The same with a cost per connector's spoke and per hub link (--spokes).
+bool g_spokes = false;
+
+// ... minimising the worst overpricing first (--spokes-worst-case).
+bool g_spokes_worst_case = false;
+
+// Cells with fewer connectors are not split (--min-split).
+std::size_t g_min_split = 4U;
+
+// How many pairs an area may keep exactly, as a direct edge between two
+// connectors (--direct-edges). See osr::area_cells::direct_.
+std::size_t g_direct_edges = 0U;
+
+// Also route every area over its medial axis and report how that compares
+// (--medial-axis). Off by default: it builds a Voronoi diagram per area.
+bool g_medial_axis = false;
 
 // Areas above this are declined as too big (--max-vertices). The strategy
 // experiments keep kMaxVertices whatever this is set to: they build the
@@ -1315,6 +1346,7 @@ triangulation greedy_triangulation(
   // n + 3h - 3 diagonals complete a triangulation of a polygon with h holes.
   auto const h = rings.size() - 1U;
   auto const needed = t.pts_.size() + 3U * h - 3U;
+  auto const walkable = osr::area_free_space{rings, barriers};
   auto diagonals = std::vector<std::pair<std::size_t, std::size_t>>{};
   for (auto const& [len, i, j] : candidates) {
     if (diagonals.size() >= needed) {
@@ -1331,8 +1363,7 @@ triangulation greedy_triangulation(
     if (crosses) {
       continue;
     }
-    if (!osr::area_geodesics::is_segment_inside(rings, t.pts_[i], t.pts_[j],
-                                                barriers)) {
+    if (!walkable.is_segment_inside(t.pts_[i], t.pts_[j])) {
       continue;
     }
     diagonals.emplace_back(i, j);
@@ -1400,6 +1431,743 @@ std::optional<library_run> run_library(
   }
   return run;
 }
+
+// How many direct connector-to-connector edges an area may keep for the pairs
+// its cells price worst, for the storage-against-tail curve.
+constexpr auto kDirectEdges = std::array{std::size_t{0U}, std::size_t{2U},
+                                         std::size_t{4U}, std::size_t{8U},
+                                         std::size_t{16U}};
+
+// How far an area is from a disc: perimeter^2 / 4 pi area, 1 for a circle,
+// 1.27 for a square, and large for a long thin corridor.
+double thinness(std::vector<std::vector<geo::latlng>> const& rings) {
+  if (rings.empty() || rings.front().size() < 3U) {
+    return 1.0;
+  }
+  auto const& r = rings.front();
+  auto const lat0 = r.front().lat();
+  auto const scale = std::cos(lat0 * geo::kPI / 180.0) *
+                     geo::kApproxDistanceLatDegrees;
+  auto twice_area = 0.0;
+  auto perimeter = 0.0;
+  for (auto i = std::size_t{0U}; i != r.size(); ++i) {
+    auto const& a = r[i];
+    auto const& b = r[(i + 1U) % r.size()];
+    auto const ax = a.lng() * scale;
+    auto const ay = a.lat() * geo::kApproxDistanceLatDegrees;
+    auto const bx = b.lng() * scale;
+    auto const by = b.lat() * geo::kApproxDistanceLatDegrees;
+    twice_area += ax * by - bx * ay;
+    perimeter += std::hypot(bx - ax, by - ay);
+  }
+  auto const area = std::abs(twice_area) / 2.0;
+  return area < 1.0 ? 1.0 : perimeter * perimeter / (4.0 * geo::kPI * area);
+}
+
+// How far a model is from the true walks it stands for.
+struct model_errors {
+  void add(double const model, double const truth) {
+    abs_.push_back(std::abs(model - truth));
+    if (model < truth - 0.5) {
+      under_.push_back(truth - model);
+    }
+  }
+
+  void print(char const* label) const {
+    auto const a = quantiles_of(abs_);
+    auto const u = quantiles_of(under_);
+    fmt::print(
+        "    {:<32} underpriced {:6} ({:5.1f}%) by p50 {:5.1f} p90 {:5.1f} | "
+        "abs err p50 {:5.1f} p90 {:5.1f} p95 {:5.1f}\n",
+        label, under_.size(),
+        abs_.empty() ? 0.0
+                     : 100.0 * static_cast<double>(under_.size()) /
+                           static_cast<double>(abs_.size()),
+        u.p50_, u.p90_, a.p50_, a.p90_, a.p95_);
+  }
+
+  std::vector<double> abs_;  // |model - truth|
+  std::vector<double> under_;  // truth - model, where cheaper by > 0.5 m
+};
+
+// The other way of routing over an area, for comparison: the medial axis -
+// the lines running down the middle of the free space, equidistant from two
+// walls - as the road through it. Valhalla builds its areas this way
+// (mjolnir/areabuilder.cc: Voronoi of the densified boundary, the inside
+// edges kept, branches pruned, the chains materialised as ways); van Toll et
+// al. and Geraerts' Explicit Corridor Map are navigation meshes on the same
+// structure. Hahmann et al. measured it against Visibility and preferred
+// Visibility. This measures it against our cells on the same areas.
+//
+// Built here from a segment Voronoi diagram of the free space's own edges
+// (Boost.Polygon, exact integer predicates), which gives the medial axis
+// directly rather than through a densified point cloud. Curved edges - those
+// between a wall and a corner - are taken as their chords.
+struct skeleton_check {
+  struct graph {
+    std::vector<geo::latlng> pos_;
+    std::vector<std::vector<std::pair<std::size_t, double>>> adj_;
+    std::size_t n_edges_{0U};
+  };
+
+  // The medial axis of `free_rings` as a graph, in meters.
+  static graph medial_axis(
+      std::vector<std::vector<geo::latlng>> const& free_rings) {
+    namespace bp = boost::polygon;
+    auto g = graph{};
+    if (free_rings.empty() || free_rings.front().size() < 3U) {
+      return g;
+    }
+
+    auto const lat0 = free_rings.front().front().lat();
+    auto const lng0 = free_rings.front().front().lng();
+    auto const scale =
+        std::cos(lat0 * geo::kPI / 180.0) * geo::kApproxDistanceLatDegrees;
+    auto const to_m = [&](geo::latlng const& p) {
+      return std::pair{(p.lng() - lng0) * scale,
+                       (p.lat() - lat0) * geo::kApproxDistanceLatDegrees};
+    };
+    auto const to_latlng = [&](double const x, double const y) {
+      return geo::latlng{lat0 + y / geo::kApproxDistanceLatDegrees,
+                         lng0 + x / scale};
+    };
+    // Millimetres: an area spans at most a few km, well inside int32.
+    auto const unit = [](double const v) {
+      return static_cast<std::int32_t>(std::llround(v * 1e3));
+    };
+
+    auto segments = std::vector<bp::segment_data<std::int32_t>>{};
+    for (auto const& r : free_rings) {
+      for (auto i = std::size_t{0U}; i != r.size(); ++i) {
+        auto const [ax, ay] = to_m(r[i]);
+        auto const [bx, by] = to_m(r[(i + 1U) % r.size()]);
+        if (unit(ax) != unit(bx) || unit(ay) != unit(by)) {
+          segments.push_back({{unit(ax), unit(ay)}, {unit(bx), unit(by)}});
+        }
+      }
+    }
+    if (segments.empty()) {
+      return g;
+    }
+
+    auto vd = bp::voronoi_diagram<double>{};
+    auto const points = std::vector<bp::point_data<std::int32_t>>{};
+    bp::construct_voronoi(points.begin(), points.end(), segments.begin(),
+                          segments.end(), &vd);
+
+    // Inside the free space, by even-odd over its own rings.
+    auto rings_m = std::vector<std::vector<std::pair<double, double>>>{};
+    for (auto const& r : free_rings) {
+      auto& out = rings_m.emplace_back();
+      for (auto const& p : r) {
+        out.push_back(to_m(p));
+      }
+    }
+    auto const inside = [&](double const x, double const y) {
+      auto in = false;
+      for (auto const& r : rings_m) {
+        for (auto i = std::size_t{0U}; i != r.size(); ++i) {
+          auto const& [ax, ay] = r[i];
+          auto const& [bx, by] = r[(i + 1U) % r.size()];
+          if ((ay > y) != (by > y) &&
+              x < ax + (y - ay) / (by - ay) * (bx - ax)) {
+            in = !in;
+          }
+        }
+      }
+      return in;
+    };
+
+    auto index = std::map<std::pair<std::int32_t, std::int32_t>, std::size_t>{};
+    auto const node = [&](double const x, double const y) {
+      auto const key = std::pair{unit(x), unit(y)};
+      auto const [it, fresh] = index.try_emplace(key, g.pos_.size());
+      if (fresh) {
+        g.pos_.push_back(to_latlng(x, y));
+        g.adj_.emplace_back();
+      }
+      return it->second;
+    };
+
+    for (auto const& e : vd.edges()) {
+      // Primary edges only: a secondary edge runs from a wall to one of its
+      // own corners and is not part of the medial axis. Both ends must exist
+      // (no infinite edges) and lie in the free space.
+      if (!e.is_primary() || !e.is_finite() || &e > e.twin()) {
+        continue;  // each edge once: the diagram stores both directions
+      }
+      auto const x0 = e.vertex0()->x() * 1e-3;
+      auto const y0 = e.vertex0()->y() * 1e-3;
+      auto const x1 = e.vertex1()->x() * 1e-3;
+      auto const y1 = e.vertex1()->y() * 1e-3;
+      if (!inside(x0, y0) || !inside(x1, y1) ||
+          !inside(0.5 * (x0 + x1), 0.5 * (y0 + y1))) {
+        continue;
+      }
+      auto const a = node(x0, y0);
+      auto const b = node(x1, y1);
+      if (a == b) {
+        continue;
+      }
+      auto const d = std::hypot(x1 - x0, y1 - y0);
+      g.adj_[a].emplace_back(b, d);
+      g.adj_[b].emplace_back(a, d);
+      ++g.n_edges_;
+    }
+    return g;
+  }
+
+  void add(std::vector<std::vector<geo::latlng>> const& rings,
+           std::vector<std::vector<geo::latlng>> const& barriers,
+           std::vector<geo::latlng> const& connectors,
+           std::vector<float> const& dist,
+           std::vector<bool> const& relevant) {
+    auto const free = osr::area_free_space{rings, barriers};
+    if (!free.valid()) {
+      return;
+    }
+    auto const g = medial_axis(free.rings());
+    auto const k = connectors.size();
+    if (g.pos_.empty()) {
+      ++n_failed_;
+      return;
+    }
+
+    // Each connector joins the nearest skeleton vertex it can walk to.
+    auto attach = std::vector<std::size_t>(k, std::numeric_limits<std::size_t>::max());
+    auto attach_cost = std::vector<double>(k, 0.0);
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      auto order = std::vector<std::pair<double, std::size_t>>{};
+      for (auto v = std::size_t{0U}; v != g.pos_.size(); ++v) {
+        order.emplace_back(geo::distance(connectors[i], g.pos_[v]), v);
+      }
+      std::ranges::partial_sort(
+          order, begin(order) + std::min<std::size_t>(8U, order.size()));
+      for (auto n = std::size_t{0U}; n != std::min<std::size_t>(8U, order.size());
+           ++n) {
+        if (free.is_segment_inside(connectors[i], g.pos_[order[n].second])) {
+          attach[i] = order[n].second;
+          attach_cost[i] = order[n].first;
+          break;
+        }
+      }
+    }
+
+    auto const inf = std::numeric_limits<double>::infinity();
+    auto const thin = thinness(rings);
+    auto n_unattached = 0;
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      if (attach[i] == std::numeric_limits<std::size_t>::max()) {
+        ++n_unattached;
+        continue;
+      }
+      auto d = std::vector<double>(g.pos_.size(), inf);
+      auto q = std::priority_queue<std::pair<double, std::size_t>,
+                                   std::vector<std::pair<double, std::size_t>>,
+                                   std::greater<>>{};
+      d[attach[i]] = 0.0;
+      q.emplace(0.0, attach[i]);
+      while (!q.empty()) {
+        auto const [cost, u] = q.top();
+        q.pop();
+        if (cost > d[u]) {
+          continue;
+        }
+        for (auto const& [v, w] : g.adj_[u]) {
+          if (cost + w < d[v]) {
+            d[v] = cost + w;
+            q.emplace(d[v], v);
+          }
+        }
+      }
+      for (auto j = i + 1U; j != k; ++j) {
+        if (attach[j] == std::numeric_limits<std::size_t>::max() ||
+            !relevant[i * k + j] ||
+            dist[i * k + j] == osr::area_geodesics::kUnreachable ||
+            d[attach[j]] == inf) {
+          continue;
+        }
+        auto const model = attach_cost[i] + d[attach[j]] + attach_cost[j];
+        (thin > 8.0 ? thin_ : compact_)
+            .add(model, static_cast<double>(dist[i * k + j]));
+      }
+    }
+
+    ++n_areas_;
+    n_vertices_ += g.pos_.size();
+    n_skeleton_edges_ += g.n_edges_;
+    n_connectors_ += k;
+    n_unattached_ += static_cast<std::size_t>(n_unattached);
+  }
+
+  void print() const {
+    if (n_areas_ == 0U) {
+      return;
+    }
+    fmt::print(
+        "  medial axis (Valhalla's way), pairs a crossing shortens: {} areas, "
+        "{} skeleton vertices, {} edges, {}/{} connectors could not reach it, "
+        "{} areas without a skeleton\n",
+        n_areas_, n_vertices_, n_skeleton_edges_, n_unattached_, n_connectors_,
+        n_failed_);
+    fmt::print(
+        "    storage: {} vertices x 8 B + {} edges x 8 B + {} attachments x "
+        "6 B = {:.1f} KiB\n",
+        n_vertices_, n_skeleton_edges_, n_connectors_ - n_unattached_,
+        (n_vertices_ * 8U + n_skeleton_edges_ * 8U +
+         (n_connectors_ - n_unattached_) * 6U) /
+            1024.0);
+    thin_.print("thin areas: medial axis");
+    compact_.print("the rest: medial axis");
+  }
+
+  model_errors thin_, compact_;
+  std::size_t n_areas_{0U}, n_failed_{0U}, n_vertices_{0U};
+  std::size_t n_skeleton_edges_{0U}, n_connectors_{0U}, n_unattached_{0U};
+};
+
+// Is a cell's hub somewhere one can walk to? If every connector of a cell sees
+// its hub, and every hub the hubs of its neighbours, spokes and hub links can
+// be priced by their straight length: a walk that exists, so the model never
+// prices a crossing below its geodesic (FINDINGS.md, section 10). Measured on
+// the cells as built, against their fitted flat costs on the same pairs.
+struct hub_check {
+  void add(std::string const& osm,
+           std::string const& name,
+           std::vector<std::vector<geo::latlng>> const& rings,
+           std::vector<std::vector<geo::latlng>> const& barriers,
+           std::vector<geo::latlng> const& connectors,
+           osr::area_cells const& cells,
+           std::vector<float> const& dist,
+           std::vector<bool> const& relevant) {
+    constexpr auto kInf = std::numeric_limits<double>::infinity();
+    auto const k = connectors.size();
+    auto const m = cells.n_cells();
+    auto const hubs = osr::hub_positions(cells, connectors);
+    auto points = connectors;
+    points.insert(end(points), begin(hubs), end(hubs));
+    auto const g = osr::area_geodesics{rings, points, barriers};
+    auto const walkable = osr::area_free_space{rings, barriers};
+    auto const sees = [&](geo::latlng const& x, geo::latlng const& y) {
+      return walkable.is_segment_inside(x, y);
+    };
+
+    ++n_areas_;
+    n_cells_ += m;
+    auto all_straight = true;
+
+    // Spokes: straight length, and the walk to the hub.
+    auto spoke_line = std::vector<double>(k, kInf);
+    auto spoke_walk = std::vector<double>(k, kInf);
+    auto cell_sees = std::vector<char>(m, 1);
+    auto hub_reached = std::vector<char>(m, 0);
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      auto const a = cells.connector_cell_[i];
+      if (a == osr::area_cells::kNoCell) {
+        continue;
+      }
+      ++n_spokes_;
+      spoke_line[i] = geo::distance(connectors[i], hubs[a]);
+      auto const w = g.distance(i, k + a);
+      if (w != osr::area_geodesics::kUnreachable) {
+        spoke_walk[i] = w;
+        hub_reached[a] = 1;
+      }
+      if (sees(connectors[i], hubs[a])) {
+        ++n_spokes_seen_;
+      } else {
+        cell_sees[a] = 0;
+        all_straight = false;
+        if (w != osr::area_geodesics::kUnreachable) {
+          spoke_detour_.push_back(w - spoke_line[i]);
+          n_spokes_near_ += w - spoke_line[i] <= 0.5 ? 1U : 0U;
+        }
+      }
+    }
+    for (auto a = std::size_t{0U}; a != m; ++a) {
+      n_cells_seen_ += cell_sees[a] != 0 ? 1U : 0U;
+      n_hubs_unreached_ += hub_reached[a] == 0 ? 1U : 0U;
+    }
+
+    // Hub links between neighbours, then the cheapest hub path, both ways of
+    // pricing them.
+    auto line = std::vector<double>(m * m, kInf);
+    auto walk = std::vector<double>(m * m, kInf);
+    for (auto a = std::size_t{0U}; a != m; ++a) {
+      line[a * m + a] = walk[a * m + a] = 0.0;
+      for (auto b = a + 1U; b != m; ++b) {
+        if (!cells.is_neighbour(static_cast<osr::area_cells::cell_idx_t>(a),
+                                static_cast<osr::area_cells::cell_idx_t>(b))) {
+          continue;
+        }
+        ++n_links_;
+        line[a * m + b] = line[b * m + a] = geo::distance(hubs[a], hubs[b]);
+        if (auto const w = g.distance(k + a, k + b);
+            w != osr::area_geodesics::kUnreachable) {
+          walk[a * m + b] = walk[b * m + a] = w;
+        }
+        if (sees(hubs[a], hubs[b])) {
+          ++n_links_seen_;
+        } else {
+          all_straight = false;
+        }
+      }
+    }
+    for (auto const d : {&line, &walk}) {
+      for (auto via = std::size_t{0U}; via != m; ++via) {
+        for (auto a = std::size_t{0U}; a != m; ++a) {
+          for (auto b = std::size_t{0U}; b != m; ++b) {
+            (*d)[a * m + b] = std::min((*d)[a * m + b],
+                                       (*d)[a * m + via] + (*d)[via * m + b]);
+          }
+        }
+      }
+    }
+    n_areas_straight_ += all_straight ? 1U : 0U;
+
+    auto const model = cells.connector_distances();
+
+    // The pair the model gets most wrong, over all pairs and over the ones a
+    // crossing actually shortens (layer 1's relevance): a pair the router
+    // would never cross anyway can be overpriced without it mattering.
+    {
+      auto worst = 0.0;
+      auto worst_relevant = 0.0;
+      auto candidates = std::size_t{0U};
+      auto errors = std::vector<double>{};  // relevant pairs, for the curve
+      auto at = std::pair{std::size_t{0U}, std::size_t{0U}};
+      auto at_relevant = std::pair{std::size_t{0U}, std::size_t{0U}};
+      for (auto i = std::size_t{0U}; i != k; ++i) {
+        for (auto j = i + 1U; j != k; ++j) {
+          auto const truth = static_cast<double>(dist[i * k + j]);
+          if (dist[i * k + j] == osr::area_geodesics::kUnreachable ||
+              !std::isfinite(model[i * k + j])) {
+            continue;
+          }
+          auto const e = std::abs(model[i * k + j] - truth);
+          if (e > worst) {
+            worst = e;
+            at = {i, j};
+          }
+          if (relevant[i * k + j]) {
+            ++n_relevant_pairs_;
+            errors.push_back(e);
+            if (e > worst_relevant) {
+              worst_relevant = e;
+              at_relevant = {i, j};
+            }
+            // What a direct connector-to-connector edge at the true distance
+            // would have to cover: the pairs the cells and spokes cannot
+            // represent. One such edge would make its pair exact.
+            if (e > std::max(10.0, 0.25 * truth)) {
+              ++candidates;
+            }
+          }
+        }
+      }
+      if (worst > 0.0) {
+        auto const [i, j] = at;
+        auto const [ri, rj] = at_relevant;
+        worst_pairs_.push_back(fmt::format(
+            R"({{"osm":"{}","name":"{}","err":{:.1f},"truth":{:.1f},)"
+            R"("model":{:.1f},"cell_i":{},"cell_j":{},"cells":{},)"
+            R"("connectors":{},"err_relevant":{:.1f},"truth_relevant":{:.1f},)"
+            R"("model_relevant":{:.1f},"candidates":{},"spokes":{}}})",
+            osm, name, worst, dist[i * k + j], model[i * k + j],
+            cells.connector_cell_[i], cells.connector_cell_[j], m, k,
+            worst_relevant, worst_relevant > 0.0 ? dist[ri * k + rj] : 0.F,
+            worst_relevant > 0.0 ? model[ri * k + rj] : 0.F, candidates,
+            cells.spoke_.empty() ? m : k + m));
+        n_candidates_ += candidates;
+        candidates_per_area_.push_back(static_cast<double>(candidates));
+
+        // What the worst pairs cost to store exactly: give an area its N
+        // worst pairs a direct connector-to-connector edge at the true
+        // distance, and its worst remaining error is the next one down.
+        std::ranges::sort(errors, std::greater<>{});
+        for (auto n = std::size_t{0U}; n != kDirectEdges.size(); ++n) {
+          auto const take = std::min(kDirectEdges[n], errors.size());
+          remaining_[n].push_back(errors.size() > take ? errors[take] : 0.0);
+          edges_added_[n] += take;
+        }
+      }
+    }
+
+    // A corridor model, for comparison: order the connectors along the area's
+    // principal axis, chain them up, and let a crossing cost the walk along
+    // the chain. One number per consecutive pair, and it never underprices -
+    // a chain of true walks is a detour of the walk it replaces. This is what
+    // a long thin area wants if anything does; the spoke model is measured on
+    // the same pairs beside it.
+    {
+      auto const lat0 = connectors.front().lat();
+      auto const scale = std::cos(lat0 * geo::kPI / 180.0);
+      auto const x = [&](geo::latlng const& p) { return p.lng() * scale; };
+      auto mx = 0.0;
+      auto my = 0.0;
+      for (auto const& c : connectors) {
+        mx += x(c);
+        my += c.lat();
+      }
+      mx /= static_cast<double>(k);
+      my /= static_cast<double>(k);
+      auto sxx = 0.0;
+      auto sxy = 0.0;
+      auto syy = 0.0;
+      for (auto const& c : connectors) {
+        auto const dx = x(c) - mx;
+        auto const dy = c.lat() - my;
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+      }
+      auto const theta = 0.5 * std::atan2(2.0 * sxy, sxx - syy);
+      auto const ux = std::cos(theta);
+      auto const uy = std::sin(theta);
+
+      auto order = std::vector<std::size_t>(k);
+      std::iota(begin(order), end(order), std::size_t{0U});
+      std::ranges::sort(order, [&](std::size_t const a, std::size_t const b) {
+        return (x(connectors[a]) - mx) * ux + (connectors[a].lat() - my) * uy <
+               (x(connectors[b]) - mx) * ux + (connectors[b].lat() - my) * uy;
+      });
+      auto place = std::vector<std::size_t>(k);
+      for (auto pos = std::size_t{0U}; pos != k; ++pos) {
+        place[order[pos]] = pos;
+      }
+      // The walk from one connector to the next along the chain, added up.
+      auto prefix = std::vector<double>(k, 0.0);
+      auto broken = false;
+      for (auto pos = std::size_t{1U}; pos != k; ++pos) {
+        auto const step = dist[order[pos - 1U] * k + order[pos]];
+        broken = broken || step == osr::area_geodesics::kUnreachable;
+        prefix[pos] = prefix[pos - 1U] + (broken ? 0.0 : step);
+      }
+
+      auto const thin = thinness(rings);
+      auto worst = 0.0;
+      if (!broken) {
+        for (auto i = std::size_t{0U}; i != k; ++i) {
+          for (auto j = i + 1U; j != k; ++j) {
+            auto const truth = static_cast<double>(dist[i * k + j]);
+            if (!relevant[i * k + j] ||
+                dist[i * k + j] == osr::area_geodesics::kUnreachable) {
+              continue;
+            }
+            auto const chain = std::abs(prefix[place[i]] - prefix[place[j]]);
+            (thin > 8.0 ? chain_thin_ : chain_compact_).add(chain, truth);
+            worst = std::max(worst, std::abs(chain - truth));
+          }
+        }
+        chain_worst_.push_back(worst);
+        (thin > 8.0 ? n_thin_ : n_compact_) += 1U;
+      }
+      for (auto i = std::size_t{0U}; i != k; ++i) {
+        for (auto j = i + 1U; j != k; ++j) {
+          if (relevant[i * k + j] &&
+              dist[i * k + j] != osr::area_geodesics::kUnreachable &&
+              std::isfinite(model[i * k + j])) {
+            (thin > 8.0 ? spoke_thin_ : spoke_compact_)
+                .add(model[i * k + j], static_cast<double>(dist[i * k + j]));
+          }
+        }
+      }
+    }
+
+    // The hubs only add points inside the area, and a shortest path bends
+    // only at reflex corners, so connector to connector must come out exactly
+    // as without them. Where it does not, one of the two builds is wrong.
+    auto first_mismatch = true;
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const before = dist[i * k + j];
+        auto const after = g.distance(i, j);
+        auto const reach_before = before != osr::area_geodesics::kUnreachable;
+        auto const reach_after = after != osr::area_geodesics::kUnreachable;
+        if (reach_before == reach_after &&
+            (!reach_before || std::abs(before - after) <= 0.01F)) {
+          continue;
+        }
+        ++n_mismatches_;
+        n_mismatch_areas_ += first_mismatch ? 1U : 0U;
+        if (first_mismatch) {
+          // The area exactly as the oracle got it, for a repro: GeoJSON's
+          // seven decimals move points by millimetres, and several of these
+          // cases hinge on less.
+          auto const exact = [](std::vector<geo::latlng> const& p) {
+            auto out = std::string{};
+            for (auto const& x : p) {
+              out += fmt::format("{}[{:.12f},{:.12f}]", out.empty() ? "" : ",",
+                                 x.lat(), x.lng());
+            }
+            return "[" + out + "]";
+          };
+          auto const exact_all =
+              [&](std::vector<std::vector<geo::latlng>> const& v) {
+                auto out = std::string{};
+                for (auto const& p : v) {
+                  out += (out.empty() ? "" : ",") + exact(p);
+                }
+                return "[" + out + "]";
+              };
+          geometries_.push_back(fmt::format(
+              R"({{"osm":"{}","name":"{}","rings":{},"barriers":{},)"
+              R"("connectors":{},"hubs":{}}})",
+              osm, name, exact_all(rings), exact_all(barriers),
+              exact(connectors), exact(hubs)));
+        }
+        if (mismatches_.size() < 60U) {
+          auto const without = osr::area_geodesics{rings, connectors, barriers};
+          auto const line = [](std::vector<geo::latlng> const& p) {
+            auto out = std::string{};
+            for (auto const& x : p) {
+              out += fmt::format("{}[{:.7f},{:.7f}]", out.empty() ? "" : ",",
+                                 x.lng(), x.lat());
+            }
+            return "[" + out + "]";
+          };
+          mismatches_.push_back(fmt::format(
+              R"({{"osm":"{}","name":"{}","i":{},"j":{},"without":{:.3f},)"
+              R"("with":{:.3f},"path_without":{},"path_with":{}}})",
+              osm, name, i, j, before, after, line(without.path(i, j)),
+              line(g.path(i, j))));
+        }
+        first_mismatch = false;
+      }
+    }
+
+    // The same pairs the model as written is measured on.
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const truth = static_cast<double>(dist[i * k + j]);
+        auto const a = cells.connector_cell_[i];
+        auto const b = cells.connector_cell_[j];
+        if (dist[i * k + j] == osr::area_geodesics::kUnreachable ||
+            truth < 1.0 || a == osr::area_cells::kNoCell ||
+            b == osr::area_cells::kNoCell || !std::isfinite(model[i * k + j])) {
+          continue;
+        }
+        fitted_.add(model[i * k + j], truth);
+        if (relevant[i * k + j]) {
+          fitted_relevant_.add(model[i * k + j], truth);
+        }
+        straight_.add(spoke_line[i] + line[a * m + b] + spoke_line[j], truth);
+        auto const walked = spoke_walk[i] + walk[a * m + b] + spoke_walk[j];
+        if (std::isfinite(walked)) {
+          walked_.add(walked, truth);
+        } else {
+          ++n_unwalkable_pairs_;
+        }
+      }
+    }
+  }
+
+  void print() const {
+    if (n_areas_ == 0U) {
+      return;
+    }
+    auto const pct = [](std::size_t const x, std::size_t const n) {
+      return n == 0U ? 0.0
+                     : 100.0 * static_cast<double>(x) / static_cast<double>(n);
+    };
+    auto const d = quantiles_of(spoke_detour_);
+    fmt::print("  hubs of the cells as built ({} meshed areas, {} cells):\n",
+               n_areas_, n_cells_);
+    fmt::print("    hub unreachable (in a hole or outside): {} cells\n",
+               n_hubs_unreached_);
+    fmt::print(
+        "    connectors that see their hub: {}/{} ({:.1f}%); blocked ones "
+        "walk p50 {:.1f} p90 {:.1f} max {:.1f} m further\n",
+        n_spokes_seen_, n_spokes_, pct(n_spokes_seen_, n_spokes_), d.p50_,
+        d.p90_, d.max_);
+    fmt::print("    ...of the blocked ones, walking at most 0.5 m further: {}\n",
+               n_spokes_near_);
+    fmt::print("    cells whose connectors all see the hub: {}/{} ({:.1f}%)\n",
+               n_cells_seen_, n_cells_, pct(n_cells_seen_, n_cells_));
+    fmt::print("    neighbouring hubs that see each other: {}/{} ({:.1f}%)\n",
+               n_links_seen_, n_links_, pct(n_links_seen_, n_links_));
+    fmt::print(
+        "    areas where every spoke and hub link is straight: {}/{} "
+        "({:.1f}%)\n",
+        n_areas_straight_, n_areas_, pct(n_areas_straight_, n_areas_));
+    fmt::print("  per connector pair ({} pairs, {} not walkable via hubs):\n",
+               fitted_.abs_.size(), n_unwalkable_pairs_);
+    fitted_.print("the model, all pairs");
+    fitted_relevant_.print("... pairs a crossing shortens");
+    fmt::print("  spokes against a corridor chain, pairs a crossing shortens:\n");
+    spoke_thin_.print(fmt::format("thin areas ({}): spokes", n_thin_).c_str());
+    chain_thin_.print(fmt::format("thin areas ({}): chain", n_thin_).c_str());
+    spoke_compact_.print(
+        fmt::format("the rest ({}): spokes", n_compact_).c_str());
+    chain_compact_.print(
+        fmt::format("the rest ({}): chain", n_compact_).c_str());
+    straight_.print("straight spokes and hub links");
+    walked_.print("walked spokes and hub links");
+    auto const c = quantiles_of(candidates_per_area_);
+    fmt::print(
+        "  pairs a crossing shortens that the model gets wrong by more than "
+        "max(10 m, 25%): {}/{} ({:.1f}%), per area p50 {:.0f} p90 {:.0f} "
+        "max {:.0f} - one direct edge each would make them exact\n",
+        n_candidates_, n_relevant_pairs_,
+        n_relevant_pairs_ == 0U
+            ? 0.0
+            : 100.0 * static_cast<double>(n_candidates_) /
+                  static_cast<double>(n_relevant_pairs_),
+        c.p50_, c.p90_, c.max_);
+    for (auto n = std::size_t{0U}; n != kDirectEdges.size(); ++n) {
+      auto const r = quantiles_of(remaining_[n]);
+      fmt::print(
+          "    keeping the {:2} worst pairs of each area as direct edges: "
+          "{:6} edges, worst remaining p50 {:5.1f} p90 {:6.1f} p95 {:6.1f} "
+          "max {:7.1f}\n",
+          kDirectEdges[n], edges_added_[n], r.p50_, r.p90_, r.p95_, r.max_);
+    }
+    fmt::print(
+        "  oracle consistency: {} connector pairs in {} areas change distance "
+        "when the hubs are added\n",
+        n_mismatches_, n_mismatch_areas_);
+  }
+
+  void write_mismatches(std::filesystem::path const& p) const {
+    auto out = std::ofstream{p};
+    for (auto const& m : mismatches_) {
+      out << m << '\n';
+    }
+    auto geometries = std::ofstream{
+        std::filesystem::path{p}.replace_extension(".mismatch-areas")};
+    for (auto const& g : geometries_) {
+      geometries << g << '\n';
+    }
+    auto worst = std::ofstream{
+        std::filesystem::path{p}.replace_extension(".worst-pairs")};
+    for (auto const& w : worst_pairs_) {
+      worst << w << '\n';
+    }
+  }
+
+  std::size_t n_areas_{0U}, n_cells_{0U}, n_hubs_unreached_{0U};
+  std::size_t n_spokes_{0U}, n_spokes_seen_{0U}, n_spokes_near_{0U};
+  std::size_t n_cells_seen_{0U};
+  std::size_t n_links_{0U}, n_links_seen_{0U}, n_areas_straight_{0U};
+  std::size_t n_unwalkable_pairs_{0U};
+  std::size_t n_mismatches_{0U}, n_mismatch_areas_{0U};
+  std::size_t n_candidates_{0U}, n_relevant_pairs_{0U};
+  std::vector<double> candidates_per_area_;
+  std::vector<std::vector<double>> remaining_{kDirectEdges.size()};
+  std::vector<std::size_t> edges_added_{std::vector<std::size_t>(
+      kDirectEdges.size(), 0U)};
+  std::vector<std::string> mismatches_;  // first few, as JSON lines
+  std::vector<std::string> geometries_;  // every mismatching area, exact
+  std::vector<std::string> worst_pairs_;  // per area, as JSON lines
+  std::vector<double> spoke_detour_;
+  model_errors fitted_, fitted_relevant_, straight_, walked_;
+
+  // Spokes against a corridor chain, on the pairs a crossing shortens, thin
+  // areas apart from the rest.
+  model_errors spoke_thin_, chain_thin_, spoke_compact_, chain_compact_;
+  std::vector<double> chain_worst_;
+  std::size_t n_thin_{0U}, n_compact_{0U};
+};
 
 // Every area the harness looks at, as GeoJSON for osr-backend's area layer:
 // its outline with a status saying what the funnel decided, and for meshed
@@ -1493,7 +2261,7 @@ struct cells_dump {
     if (cells != nullptr) {
       auto const k = connectors.size();
       auto const m = cells->n_cells();
-      auto const cd = cells->cell_distances();
+      auto const model = cells->connector_distances();
       auto errors = std::vector<double>{};
       for (auto i = std::size_t{0U}; i != k; ++i) {
         for (auto j = i + 1U; j != k; ++j) {
@@ -1502,7 +2270,7 @@ struct cells_dump {
           auto const b = cells->connector_cell_[j];
           if (truth != osr::area_geodesics::kUnreachable && truth >= 1.0 &&
               a != osr::area_cells::kNoCell && b != osr::area_cells::kNoCell) {
-            errors.push_back(std::abs(static_cast<double>(cd[a * m + b]) -
+            errors.push_back(std::abs(static_cast<double>(model[i * k + j]) -
                                       static_cast<double>(truth)));
           }
         }
@@ -1570,9 +2338,22 @@ struct cells_dump {
                     fmt::format(R"("kind":"neighbour",{},"from":{},"to":{},)"
                                 R"("cost":{:.1f})",
                                 osm, c, d,
-                                0.5 * (cells->cost_[c] + cells->cost_[d])));
+                                cells->link_cost(
+                                    static_cast<osr::area_cells::cell_idx_t>(c),
+                                    static_cast<osr::area_cells::cell_idx_t>(d))));
           }
         }
+      }
+    }
+
+    // The pairs kept exactly (osr::area_cells::direct_).
+    if (cells != nullptr) {
+      for (auto const& d : cells->direct_) {
+        feature(
+            fmt::format(R"({{"type":"LineString","coordinates":{}}})",
+                        coords({connectors[d.a_], connectors[d.b_]}, false)),
+            fmt::format(R"("kind":"direct",{},"from":{},"to":{},"cost":{:.1f})",
+                        osm, d.a_, d.b_, d.cost_));
       }
     }
 
@@ -1582,11 +2363,12 @@ struct cells_dump {
         cell = R"(,"unreachable":true)";
       } else if (cells != nullptr) {
         auto const c = cells->connector_cell_[i];
-        cell = fmt::format(R"(,"cell":{})", c);
+        cell = fmt::format(R"(,"cell":{},"spoke":{:.2f})", c,
+                           cells->spoke_cost(i));
         feature(fmt::format(R"({{"type":"LineString","coordinates":{}}})",
                             coords({connectors[i], hubs[c]}, false)),
                 fmt::format(R"("kind":"spoke",{},"cell":{},"cost":{:.1f})",
-                            osm, c, 0.5 * cells->cost_[c]));
+                            osm, c, cells->spoke_cost(i)));
       }
       feature(fmt::format(R"({{"type":"Point","coordinates":{}}})",
                           coord(connectors[i])),
@@ -1608,10 +2390,10 @@ struct cells_dump {
       auto const c = quantiles_of(cells_per_area_);
       fmt::print(
           "  the model as written ({}): cells/area p50 {:.0f} p90 {:.0f} | "
-          "route err p50 {:.1f} p90 {:.1f} p95 {:.1f}\n",
+          "route err p50 {:.1f} p90 {:.1f} p95 {:.1f} max {:.1f}\n",
           g_tree_neighbours ? "one neighbour pair per cut"
                             : "cells neighbour where they share a border",
-          c.p50_, c.p90_, e.p50_, e.p90_, e.p95_);
+          c.p50_, c.p90_, e.p50_, e.p90_, e.p95_, e.max_);
     }
   }
 
@@ -1627,7 +2409,10 @@ int main(int argc, char** argv) {
                "usage: {} [--strict-levels] [--cells-out <geojson>] "
                "[--cells-t <meters>] [--max-vertices <n>] "
                "[--no-interior-ways] [--place-square] [--no-merge] "
-               "[--tree-neighbours] <osm-file> [more-osm-files...]\n",
+               "[--tree-neighbours] [--check-visibility] [--no-underpricing] "
+               "[--spokes] [--spokes-worst-case] [--min-split <n>] "
+               "[--direct-edges <n>] [--medial-axis] <osm-file> "
+               "[more-osm-files...]\n",
                argv[0]);
     return 1;
   }
@@ -1636,6 +2421,8 @@ int main(int argc, char** argv) {
   auto cells_out = std::optional<std::filesystem::path>{};
   auto cells_t = 10.0;
   auto dump = cells_dump{};
+  auto hubs = hub_check{};
+  auto skeleton = skeleton_check{};
   for (auto arg = 1; arg != argc; ++arg) {
     auto const opt = std::string_view{argv[arg]};
     if (opt == "--strict-levels") {
@@ -1666,6 +2453,34 @@ int main(int argc, char** argv) {
       g_tree_neighbours = true;
       continue;
     }
+    if (opt == "--check-visibility") {
+      g_check_visibility = true;
+      continue;
+    }
+    if (opt == "--no-underpricing") {
+      g_no_underpricing = true;
+      continue;
+    }
+    if (opt == "--spokes") {
+      g_spokes = true;
+      continue;
+    }
+    if (opt == "--spokes-worst-case") {
+      g_spokes_worst_case = true;
+      continue;
+    }
+    if (opt == "--min-split" && arg + 1 != argc) {
+      g_min_split = std::stoul(argv[++arg]);
+      continue;
+    }
+    if (opt == "--direct-edges" && arg + 1 != argc) {
+      g_direct_edges = std::stoul(argv[++arg]);
+      continue;
+    }
+    if (opt == "--medial-axis") {
+      g_medial_axis = true;
+      continue;
+    }
     if (opt == "--max-vertices" && arg + 1 != argc) {
       g_max_vertices = std::stoul(argv[++arg]);
       continue;
@@ -1682,7 +2497,16 @@ int main(int argc, char** argv) {
                           .interior_ways_ = g_interior_ways,
                           .max_vertices_ = g_max_vertices,
                           .cells_threshold_ = cells_t,
-                          .shared_borders_ = !g_tree_neighbours};
+                          .shared_borders_ = !g_tree_neighbours,
+                          .cell_fit_ =
+                              g_spokes_worst_case
+                                  ? osr::cost_fit::kSpokesWorstCase
+                              : g_spokes ? osr::cost_fit::kSpokes
+                              : g_no_underpricing
+                                  ? osr::cost_fit::kNoUnderpricing
+                                  : osr::cost_fit::kLeastSquares,
+                          .min_split_ = g_min_split,
+                          .direct_edges_ = g_direct_edges};
     auto const data = osr::collect_areas(path, options);
     if (g_merge) {
       auto const& m = data.merged_;
@@ -1745,6 +2569,17 @@ int main(int argc, char** argv) {
     auto n_areas_with_building = 0;
     auto n_buildings_inside = 0;
     auto n_restricted_connectors = 0;
+    auto n_visibility_checked = 0;
+    auto n_visibility_differ = 0;  // areas
+    auto n_visibility_edges_differ = std::size_t{0U};
+    auto n_visibility_fallback = 0;  // sweep not usable after snapping
+    auto n_fallback_barriers = 0;
+    auto n_fallback_plain = 0;
+    auto fallback_examples = std::vector<std::string>{};
+    auto n_visibility_edges = std::size_t{0U};
+    auto sweep_seconds = 0.0;
+    auto pairwise_seconds = 0.0;
+    auto worst_visibility = std::string{};
 
     auto n_areas_with_stranded = 0;
     auto worst_network = std::vector<double>{};
@@ -1837,6 +2672,69 @@ int main(int argc, char** argv) {
 
       auto const& g = *pa.geodesics_;
 
+      if (g_check_visibility) {
+        auto const timed = [&](osr::visibility_algorithm const algorithm,
+                               double& seconds) {
+          auto const start = std::chrono::steady_clock::now();
+          auto built =
+              osr::area_geodesics{rings, connectors, barriers,
+                                  {.algorithm_ = algorithm}};
+          seconds += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+          return built;
+        };
+        auto const swept =
+            timed(osr::visibility_algorithm::kSweep, sweep_seconds);
+        auto const pairwise =
+            timed(osr::visibility_algorithm::kPairwise, pairwise_seconds);
+        ++n_visibility_checked;
+        n_visibility_fallback += swept.swept() ? 0 : 1;
+        if (!swept.swept()) {
+          ++(barriers.empty() ? n_fallback_plain : n_fallback_barriers);
+          if (fallback_examples.size() < 10U) {
+            fallback_examples.push_back(fmt::format(
+                "{}/{} {} ({} barriers, {} rings)",
+                a.from_way_ ? "way" : "relation", a.id_, a.name_,
+                barriers.size(), rings.size()));
+            // The area exactly as the oracle got it, for a repro.
+            auto const exact = [](std::vector<geo::latlng> const& p) {
+              auto out = std::string{};
+              for (auto const& x : p) {
+                out += fmt::format("{}[{:.12f},{:.12f}]",
+                                   out.empty() ? "" : ",", x.lat(), x.lng());
+              }
+              return "[" + out + "]";
+            };
+            auto const exact_all =
+                [&](std::vector<std::vector<geo::latlng>> const& v) {
+                  auto out = std::string{};
+                  for (auto const& p : v) {
+                    out += (out.empty() ? "" : ",") + exact(p);
+                  }
+                  return "[" + out + "]";
+                };
+            fmt::print(
+                "FALLBACK {{\"osm\":\"{}/{}\",\"rings\":{},\"barriers\":{},"
+                "\"connectors\":{}}}\n",
+                a.from_way_ ? "way" : "relation", a.id_, exact_all(rings),
+                exact_all(barriers), exact(connectors));
+          }
+        }
+        n_visibility_edges += pairwise.edges().size();
+        auto differ = std::vector<std::pair<std::uint32_t, std::uint32_t>>{};
+        std::ranges::set_symmetric_difference(swept.edges(), pairwise.edges(),
+                                              std::back_inserter(differ));
+        if (!differ.empty()) {
+          ++n_visibility_differ;
+          n_visibility_edges_differ += differ.size();
+          if (worst_visibility.empty()) {
+            worst_visibility = fmt::format(
+                "{}/{} {}", a.from_way_ ? "way" : "relation", a.id_, a.name_);
+          }
+        }
+      }
+
       auto all = std::vector<std::size_t>(connectors.size());
       for (auto i = std::size_t{0U}; i != all.size(); ++i) {
         all[i] = i;
@@ -1874,6 +2772,10 @@ int main(int argc, char** argv) {
                      end(pa.relevance_.outline_detours_));
       auto const& relevant = pa.relevance_.relevant_;
 
+      if (g_medial_axis) {
+        skeleton.add(rings, barriers, connectors, geo_dist, relevant);
+      }
+
       // Layer 1's verdict: served where every relevant pair of ring
       // connectors is within max_detour_ of its shortest walk over mapped
       // ways, and no interior connector is stranded.
@@ -1897,6 +2799,10 @@ int main(int argc, char** argv) {
         case osr::area_status::kMeshed:
           dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
                     "meshed", &*pa.cells_, &geo_dist, &pa.regions_);
+          hubs.add(fmt::format("{}/{}", a.from_way_ ? "way" : "relation",
+                               a.id_),
+                   a.name_, rings, barriers, connectors, *pa.cells_, geo_dist,
+                   relevant);
           break;
         case osr::area_status::kUnreachable:
           dump.area(a, rings, barriers, connectors, connector_ids, on_ring,
@@ -1976,6 +2882,7 @@ int main(int argc, char** argv) {
         // A connector inside a triangle is not a polygon vertex, so it hangs
         // off the three nearest corners it can see - no new vertices in the
         // polygon, three edges each.
+        auto const walkable = osr::area_free_space{rings, barriers};
         for (auto i = std::size_t{0U}; i != connectors.size(); ++i) {
           if (conn_node[i] < tri.pts_.size()) {
             continue;
@@ -1991,8 +2898,7 @@ int main(int argc, char** argv) {
             if (joined == 3) {
               break;
             }
-            if (osr::area_geodesics::is_segment_inside(rings, connectors[i],
-                                                       tri.pts_[v], barriers)) {
+            if (walkable.is_segment_inside(connectors[i], tri.pts_[v])) {
               add(conn_node[i], v);
               ++joined;
             }
@@ -2457,6 +3363,10 @@ int main(int argc, char** argv) {
 
     if (cells_out.has_value()) {
       dump.write(*cells_out);
+      hubs.print();
+      skeleton.print();
+      hubs.write_mismatches(
+          std::filesystem::path{*cells_out}.replace_extension(".mismatches"));
     }
 
     fmt::print(
@@ -2480,6 +3390,23 @@ int main(int argc, char** argv) {
         "  connectors: {} on the boundary, {} interior "
         "(stairs/lifts/stubs ending inside)\n",
         n_boundary_connectors, n_interior_connectors);
+    if (g_check_visibility) {
+      fmt::print(
+          "  visibility, sweep vs pairwise: {} areas, {} edges; {} areas "
+          "differ ({} edges{}{}); {} fell back to pairwise | build time "
+          "sweep {:.1f} s, pairwise {:.1f} s\n",
+          n_visibility_checked, n_visibility_edges, n_visibility_differ,
+          n_visibility_edges_differ, worst_visibility.empty() ? "" : ", first: ",
+          worst_visibility, n_visibility_fallback, sweep_seconds,
+          pairwise_seconds);
+      fmt::print(
+          "    fell back (walls crossing after snapping): {} with barriers, "
+          "{} without\n",
+          n_fallback_barriers, n_fallback_plain);
+      for (auto const& e : fallback_examples) {
+        fmt::print("      {}\n", e);
+      }
+    }
     if (n_reported == 0) {
       continue;
     }

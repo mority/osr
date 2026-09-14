@@ -143,16 +143,28 @@ struct http_server::impl {
               << area_routing_->n_without_routing_node_
               << " are no routing node (left out)\n";
     for (auto& f : doc.as_object().at("features").as_array()) {
-      auto const osm = std::string{
-          f.as_object().at("properties").as_object().at("osm").as_string()};
+      auto const& props = f.as_object().at("properties").as_object();
+      auto const osm = std::string{props.at("osm").as_string()};
       auto const [it, inserted] = by_osm.emplace(osm, areas_.size());
       if (inserted) {
         areas_.emplace_back();
       }
       auto& area = areas_[it->second];
+      if (auto const* lv = props.if_contains("levels"); lv != nullptr) {
+        area.levels_ = *lv;
+      }
       extend(extend, area.bbox_,
              f.as_object().at("geometry").as_object().at("coordinates"));
       area.features_.emplace_back(std::move(f));
+    }
+
+    // The skeletons are held by area_routing, which groups the pieces of a
+    // merged area separately; the features here are grouped by osm id.
+    for (auto i = std::size_t{0U}; i != area_routing_->n_areas(); ++i) {
+      if (auto const it = by_osm.find(area_routing_->osm_of(i));
+          it != end(by_osm)) {
+        areas_[it->second].skeletons_.push_back(i);
+      }
     }
     std::cout << "loaded " << areas_.size() << " areas with cells from " << p
               << '\n';
@@ -167,9 +179,29 @@ struct http_server::impl {
         geo::latlng{waypoints[3].as_double(), waypoints[2].as_double()}};
     auto features = json::array{};
     for (auto const& a : areas_) {
-      if (a.bbox_.overlaps(view)) {
-        for (auto const& f : a.features_) {
-          features.push_back(f);
+      if (!a.bbox_.overlaps(view)) {
+        continue;
+      }
+      for (auto const& f : a.features_) {
+        features.push_back(f);
+      }
+      // The medial axis of the same area, for the Skeleton layer.
+      for (auto const i : a.skeletons_) {
+        auto const& osm = area_routing_->osm_of(i);
+        for (auto const& [from, to] : area_routing_->skeleton(i).edges()) {
+          auto props = json::object{{"kind", "skeleton"}, {"osm", osm}};
+          if (!a.levels_.is_null()) {
+            props["levels"] = a.levels_;
+          }
+          features.push_back(json::object{
+              {"type", "Feature"},
+              {"properties", std::move(props)},
+              {"geometry",
+               json::object{
+                   {"type", "LineString"},
+                   {"coordinates",
+                    json::array{json::array{from.lng(), from.lat()},
+                                json::array{to.lng(), to.lat()}}}}}});
         }
       }
     }
@@ -279,6 +311,23 @@ struct http_server::impl {
               {"model_distance", c.model_distance_},
               {"geodesic_distance", c.geodesic_distance_}}},
             {"geometry", to_line_string(c.geodesic_)}});
+        // The same crossing over the medial axis: what the other approach
+        // would have the walker do.
+        if (auto const over_skeleton = area_routing_->skeleton_path(c);
+            over_skeleton.size() >= 2U) {
+          auto length = 0.0;
+          for (auto i = std::size_t{1U}; i != over_skeleton.size(); ++i) {
+            length += geo::distance(over_skeleton[i - 1U], over_skeleton[i]);
+          }
+          features.push_back(json::object{
+              {"type", "Feature"},
+              {"properties",
+               {{"skeleton", true},
+                {"level", c.level_.to_float()},
+                {"area_osm", area_routing_->osm_of(c.area_)},
+                {"skeleton_distance", length}}},
+              {"geometry", to_line_string(over_skeleton)}});
+        }
       }
     }
     cb(json_response(req, json::serialize(fc)));
@@ -484,6 +533,8 @@ private:
   elevation_storage const* elevations_;
 
   struct area_features {
+    json::value levels_;  // the area's levels, for its skeleton features
+    std::vector<std::size_t> skeletons_;  // its pieces in area_routing_
     geo::box bbox_;
     json::array features_;
   };

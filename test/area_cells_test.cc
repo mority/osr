@@ -56,6 +56,182 @@ std::size_t n_neighbour_pairs(area_cells const& c) {
 
 }  // namespace
 
+TEST(area_cells, the_no_underpricing_fit_prices_no_crossing_too_low) {
+  // Scattered connectors in an empty area: least squares errs both ways, so
+  // some crossings come out cheaper than walking them.
+  auto rng = std::mt19937{7U};
+  auto x = std::uniform_real_distribution<double>{0.0, 200.0};
+  auto y = std::uniform_real_distribution<double>{0.0, 100.0};
+  auto pts = std::vector<geo::latlng>{};
+  for (auto i = 0; i != 40; ++i) {
+    pts.push_back(at(x(rng), y(rng)));
+  }
+  auto const d = straight_lines(pts);
+  auto const k = pts.size();
+
+  auto const underpriced = [&](cost_fit const fit) {
+    auto const cells =
+        build_area_cells(pts, d, all_relevant(k), {.threshold_ = 10.0, .fit_ = fit});
+    EXPECT_TRUE(cells.has_value());
+    auto const m = cells->n_cells();
+    auto const model = cells->cell_distances();
+    auto n = 0;
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const a = cells->connector_cell_[i];
+        auto const b = cells->connector_cell_[j];
+        n += model[a * m + b] < d[i * k + j] - 1e-2F ? 1 : 0;
+      }
+    }
+    return n;
+  };
+  EXPECT_GT(underpriced(cost_fit::kLeastSquares), 0);
+  EXPECT_EQ(0, underpriced(cost_fit::kNoUnderpricing));
+}
+
+TEST(area_cells, spokes_price_no_crossing_too_low_and_beat_flat_costs) {
+  auto rng = std::mt19937{7U};
+  auto x = std::uniform_real_distribution<double>{0.0, 200.0};
+  auto y = std::uniform_real_distribution<double>{0.0, 100.0};
+  auto pts = std::vector<geo::latlng>{};
+  for (auto i = 0; i != 40; ++i) {
+    pts.push_back(at(x(rng), y(rng)));
+  }
+  auto const d = straight_lines(pts);
+  auto const k = pts.size();
+
+  struct result {
+    int underpriced_{0};
+    double overpricing_{0.0};
+  };
+  auto const measure = [&](cost_fit const fit) {
+    auto const cells = build_area_cells(pts, d, all_relevant(k),
+                                        {.threshold_ = 10.0, .fit_ = fit});
+    EXPECT_TRUE(cells.has_value());
+    auto const model = cells->connector_distances();
+    auto r = result{};
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const err = model[i * k + j] - d[i * k + j];
+        r.underpriced_ += err < -1e-2F ? 1 : 0;
+        r.overpricing_ += std::max(0.F, err);
+      }
+    }
+    return r;
+  };
+  auto const flat = measure(cost_fit::kNoUnderpricing);
+  auto const spokes = measure(cost_fit::kSpokes);
+  EXPECT_EQ(0, flat.underpriced_);
+  EXPECT_EQ(0, spokes.underpriced_);
+  EXPECT_LT(spokes.overpricing_, flat.overpricing_);
+}
+
+TEST(area_cells, the_worst_case_fit_lowers_the_worst_overpricing) {
+  auto rng = std::mt19937{7U};
+  auto x = std::uniform_real_distribution<double>{0.0, 200.0};
+  auto y = std::uniform_real_distribution<double>{0.0, 100.0};
+  auto pts = std::vector<geo::latlng>{};
+  for (auto i = 0; i != 40; ++i) {
+    pts.push_back(at(x(rng), y(rng)));
+  }
+  auto const d = straight_lines(pts);
+  auto const k = pts.size();
+
+  struct result {
+    int underpriced_{0};
+    float worst_{0.F};
+  };
+  auto const measure = [&](cost_fit const fit) {
+    // One cell: the cells are the same whichever fit, only the costs differ.
+    auto const cells = build_area_cells(
+        pts, d, all_relevant(k), {.threshold_ = 1e9, .fit_ = fit});
+    EXPECT_TRUE(cells.has_value());
+    auto const model = cells->connector_distances();
+    auto r = result{};
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const err = model[i * k + j] - d[i * k + j];
+        r.underpriced_ += err < -1e-2F ? 1 : 0;
+        r.worst_ = std::max(r.worst_, err);
+      }
+    }
+    return r;
+  };
+  auto const sum = measure(cost_fit::kSpokes);
+  auto const worst = measure(cost_fit::kSpokesWorstCase);
+  EXPECT_EQ(0, worst.underpriced_);
+  EXPECT_LE(worst.worst_, sum.worst_ + 1e-2F);
+}
+
+TEST(area_cells, direct_edges_keep_the_worst_pairs_exact) {
+  // A spoke has to cover its connector's most distant partner, so a pair of
+  // neighbours in a long area comes out many times its true length. A direct
+  // edge between them is the true walk, and still never underprices.
+  auto rng = std::mt19937{11U};
+  auto x = std::uniform_real_distribution<double>{0.0, 400.0};
+  auto y = std::uniform_real_distribution<double>{0.0, 60.0};
+  auto pts = std::vector<geo::latlng>{};
+  for (auto i = 0; i != 30; ++i) {
+    pts.push_back(at(x(rng), y(rng)));
+  }
+  auto const d = straight_lines(pts);
+  auto const k = pts.size();
+
+  struct result {
+    float worst_{0.F};
+    int underpriced_{0};
+    std::size_t edges_{0U};
+  };
+  auto const measure = [&](std::size_t const direct) {
+    auto const cells = build_area_cells(
+        pts, d, all_relevant(k),
+        {.threshold_ = 10.0, .fit_ = cost_fit::kSpokes, .direct_edges_ = direct});
+    EXPECT_TRUE(cells.has_value());
+    auto const model = cells->connector_distances();
+    auto r = result{.edges_ = cells->direct_.size()};
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const err = model[i * k + j] - d[i * k + j];
+        r.worst_ = std::max(r.worst_, err);
+        r.underpriced_ += err < -1e-2F ? 1 : 0;
+      }
+    }
+    return r;
+  };
+  auto const none = measure(0U);
+  auto const some = measure(4U);
+  EXPECT_EQ(0U, none.edges_);
+  EXPECT_EQ(4U, some.edges_);
+  EXPECT_LT(some.worst_, none.worst_);
+  EXPECT_EQ(0, none.underpriced_);
+  EXPECT_EQ(0, some.underpriced_);
+}
+
+TEST(area_cells, connector_distances_are_the_flat_model) {
+  auto rng = std::mt19937{3U};
+  auto x = std::uniform_real_distribution<double>{0.0, 200.0};
+  auto pts = std::vector<geo::latlng>{};
+  for (auto i = 0; i != 25; ++i) {
+    pts.push_back(at(x(rng), x(rng)));
+  }
+  auto const k = pts.size();
+  auto const cells =
+      build_area_cells(pts, straight_lines(pts), all_relevant(k), {});
+  ASSERT_TRUE(cells.has_value());
+  auto const m = cells->n_cells();
+  auto const by_cell = cells->cell_distances();
+  auto const by_connector = cells->connector_distances();
+  for (auto i = std::size_t{0U}; i != k; ++i) {
+    for (auto j = std::size_t{0U}; j != k; ++j) {
+      if (i != j) {
+        auto const a = cells->connector_cell_[i];
+        auto const b = cells->connector_cell_[j];
+        EXPECT_NEAR(by_cell[a * m + b], by_connector[i * k + j], 1e-3F);
+      }
+    }
+  }
+}
+
 TEST(area_cells, one_cell_when_within_threshold) {
   auto const pts =
       std::vector{at(0, 0), at(30, 0), at(30, 30), at(0, 30), at(15, 15)};

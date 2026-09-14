@@ -41,7 +41,25 @@ if (OSR_MIMALLOC AND WIN32)
 endif ()
 
 include(cmake/buildcache.cmake)
+
+# HiGHS, the LP solver behind the area cost fit: only its static library.
+# (HiGHS turns shared libraries on by default, and would pick up the system
+# zlib next to zlib-ng.)
+set(BUILD_SHARED_LIBS OFF)
+set(BUILD_SHARED_EXTRAS_LIB OFF)
+set(BUILD_CXX_EXE OFF)
+set(BUILD_EXAMPLES OFF)
+set(ZLIB OFF)
+
 include(cmake/pkg.cmake)
+
+# HiGHS's headers are not clean under osr's -Wall -Wextra -Werror: consumers
+# get them as system headers.
+if (TARGET highs)
+    get_target_property(highs-include-dirs highs INTERFACE_INCLUDE_DIRECTORIES)
+    set_property(TARGET highs APPEND PROPERTY
+            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES ${highs-include-dirs})
+endif ()
 
 if (OSR_MIMALLOC)
     if (WIN32)
@@ -127,6 +145,7 @@ target_link_libraries(osr
         date-tz
         rtree
         tg
+        highs
         unordered_dense
         boost-thread
         boost-iostreams

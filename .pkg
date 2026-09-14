@@ -26,6 +26,10 @@
   url=git@github.com:motis-project/googletest.git
   branch=master
   commit=9758d168fd1ccff2d76f3bd6ef802943d0f8f7e5
+[HiGHS]
+  url=https://github.com/ERGO-Code/HiGHS.git
+  branch=master
+  commit=04024d701f79feb8e2f18bc3df0dffc04ef05088
 [mimalloc]
   url=git@github.com:motis-project/mimalloc.git
   branch=master

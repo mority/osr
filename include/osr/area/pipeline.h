@@ -40,6 +40,10 @@ struct area_options {
   // Cells neighbour where their regions share a border; off: one neighbour
   // pair per cut, which always yields a tree.
   bool shared_borders_{true};
+
+  cost_fit cell_fit_{cost_fit::kLeastSquares};  // see cost_fit
+  std::size_t min_split_{4U};  // see area_cells_params::min_split_
+  std::size_t direct_edges_{0U};  // see area_cells_params::direct_edges_
 };
 
 // Where a way stops inside an area rather than on its edge - the end of a

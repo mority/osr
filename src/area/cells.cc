@@ -1,5 +1,7 @@
 #include "osr/area/cells.h"
 
+#include "Highs.h"
+
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -35,6 +37,19 @@ constexpr auto kRidge = 1e-3;
 
 // Closer than this, two connectors are not a crossing worth modelling.
 constexpr auto kMinPairDistance = 1.0;
+
+// The no-underpricing fit (cost_fit::kNoUnderpricing): a tiny cost on every
+// cell breaks ties towards the smallest costs; a route is too cheap once it
+// undercuts its geodesic by more than kMaxUnderpricing; and constraints are
+// added at most kMaxLpRounds times per solve.
+constexpr auto kTieBreak = 1e-6;
+constexpr auto kMaxUnderpricing = 1e-3;  // m
+constexpr auto kMaxLpRounds = 1000;
+
+// A pair is worth a direct edge (area_cells_params::direct_edges_) once the
+// model is off by more than this - in meters, or as a share of the walk.
+constexpr auto kDirectMinError = 10.0;
+constexpr auto kDirectMinShare = 0.25;
 
 std::size_t bit_index(std::size_t const m, std::size_t a, std::size_t b) {
   if (a > b) {
@@ -86,6 +101,39 @@ void cell_paths(std::size_t const m,
           test_bit(neighbours, bit_index(m, u, v)) &&
           dist[u] + cost[v] < dist[v]) {
         dist[v] = dist[u] + cost[v];
+        pred[v] = u;
+      }
+    }
+  }
+}
+
+// Cheapest hub paths from `src` when a path costs the sum of its links - the
+// per-connector model. `link` is m x m, infinite between cells that are not
+// neighbours.
+void link_paths(std::size_t const m,
+                std::vector<double> const& link,
+                std::size_t const src,
+                double* dist,
+                std::size_t* pred) {
+  auto done = std::vector<char>(m, 0);
+  std::fill(dist, dist + m, kInf);
+  std::fill(pred, pred + m, kNone);
+  dist[src] = 0.0;
+  for (auto round = std::size_t{0U}; round != m; ++round) {
+    auto u = kNone;
+    for (auto v = std::size_t{0U}; v != m; ++v) {
+      if (done[v] == 0 && dist[v] != kInf && (u == kNone || dist[v] < dist[u])) {
+        u = v;
+      }
+    }
+    if (u == kNone) {
+      break;
+    }
+    done[u] = 1;
+    for (auto v = std::size_t{0U}; v != m; ++v) {
+      if (done[v] == 0 && link[u * m + v] != kInf &&
+          dist[u] + link[u * m + v] < dist[v]) {
+        dist[v] = dist[u] + link[u * m + v];
         pred[v] = u;
       }
     }
@@ -379,6 +427,11 @@ struct frontier {
 struct fit {
   std::vector<double> cost_;
   std::vector<int> violations_;
+
+  // Per-connector costs (cost_fit::kSpokes), empty otherwise: spokes by
+  // connector, links m x m (infinite between cells that are not neighbours).
+  std::vector<double> spoke_;
+  std::vector<double> link_;
 };
 
 struct builder {
@@ -426,7 +479,7 @@ struct builder {
   void split(std::size_t const n, std::size_t const depth) {
     // Copied: nodes_ grows below.
     auto const conns = nodes_[n].connectors_;
-    if (depth == 0U || conns.size() < 4U) {
+    if (depth == 0U || conns.size() < std::max<std::size_t>(2U, min_split_)) {
       return;
     }
 
@@ -621,7 +674,9 @@ struct builder {
   // The costs are free parameters: the cells only fix which costs a pair's
   // route adds up, and the costs are whatever reproduces the true distances
   // best. Fitting each cell alone from its own pairs would be a guess.
-  fit fit_costs(frontier const& f, double const threshold) const {
+  fit fit_costs(frontier const& f,
+                double const threshold,
+                cost_fit const kind) const {
     auto const m = f.owner_.size();
 
     auto cell_of = std::vector<std::size_t>(k_, kNone);
@@ -640,7 +695,9 @@ struct builder {
     // minimises the worst error inside it. Only kept if there is too little
     // to fit. A cell with a single connector has no pair and starts at zero.
     auto result = fit{.cost_ = std::vector<double>(m, 0.0),
-                      .violations_ = std::vector<int>(m, 0)};
+                      .violations_ = std::vector<int>(m, 0),
+                      .spoke_ = {},
+                      .link_ = {}};
     for (auto ci = std::size_t{0U}; ci != m; ++ci) {
       auto const& conns = nodes_[f.owner_[ci]].connectors_;
       auto lo = kInf;
@@ -723,6 +780,10 @@ struct builder {
       }
     }
 
+    if (kind == cost_fit::kNoUnderpricing) {
+      no_underpricing(m, neighbours, cell_of, result.cost_);
+    }
+
     derive_paths();
     for_each_pair(
         [&](std::size_t const a, std::size_t const b, double const truth) {
@@ -734,11 +795,397 @@ struct builder {
     return result;
   }
 
+  // Per-connector costs (cost_fit::kSpokes, kSpokesWorstCase). The flat model
+  // charges every crossing through a cell alike, so a fit that may not
+  // underprice has to charge each cell its longest crossing, and a short
+  // crossing pays for the long one. Here each connector's spoke to its hub has
+  // a cost of its own, and so has each link between neighbouring hubs: a
+  // crossing from i to j costs spoke(i) + the cheapest hub path + spoke(j).
+  //
+  // No pair may be priced below its geodesic: every cell path has to cost at
+  // least the longest geodesic it carries. There is a constraint for every
+  // path; they are added as they are needed - solve, find the pairs whose
+  // cheapest path is still too cheap, add those paths, solve again - and kept,
+  // since they hold whatever the costs.
+  //
+  // What is minimised: the overpricing summed over all pairs, along the
+  // routes the costs give (kSpokes). Or first the worst overpricing of any
+  // pair, and then, holding that, the sum (kSpokesWorstCase): every pair's
+  // route may cost at most its geodesic plus t, and t is minimised. A route
+  // bounds the cheapest path from above, so the model keeps to it too.
+  //
+  // The routes follow the costs, so all of it is redone from them for a few
+  // rounds. The flat least-squares fit seeds the first routes, and is what is
+  // returned if the solver fails.
+  fit fit_spokes(frontier const& f,
+                 double const threshold,
+                 bool const worst_case) const {
+    auto result = fit_costs(f, threshold, cost_fit::kLeastSquares);
+    auto const m = f.owner_.size();
+
+    auto cell_of = std::vector<std::size_t>(k_, kNone);
+    for (auto ci = std::size_t{0U}; ci != m; ++ci) {
+      for (auto const c : nodes_[f.owner_[ci]].connectors_) {
+        cell_of[c] = ci;
+      }
+    }
+
+    auto link_of = std::vector<std::size_t>(m * m, kNone);
+    auto links = std::vector<std::pair<std::size_t, std::size_t>>{};
+    for (auto const& [p, q] : f.neighbours_) {
+      auto const a = std::min(p, q);
+      auto const b = std::max(p, q);
+      if (a != b && link_of[a * m + b] == kNone) {
+        link_of[a * m + b] = link_of[b * m + a] = links.size();
+        links.emplace_back(a, b);
+      }
+    }
+    // Columns: a spoke per connector, a cost per link, and for the worst case
+    // the worst overpricing t.
+    auto const t = k_ + links.size();
+    auto const n_cols = t + (worst_case ? 1U : 0U);
+
+    // Every pair counts, however short: the router may take any.
+    struct need {
+      std::size_t i_, j_, a_, b_;
+      double geodesic_;
+    };
+    auto pairs = std::vector<need>{};
+    auto uses = std::vector<double>(k_, 0.0);
+    for (auto src = std::size_t{0U}; src != k_; ++src) {
+      for (auto dst = src + 1U; dst != k_; ++dst) {
+        auto const truth = distance(src, dst);
+        if (truth == area_geodesics::kUnreachable || cell_of[src] == kNone ||
+            cell_of[dst] == kNone) {
+          continue;
+        }
+        pairs.push_back({.i_ = src,
+                         .j_ = dst,
+                         .a_ = cell_of[src],
+                         .b_ = cell_of[dst],
+                         .geodesic_ = static_cast<double>(truth)});
+        uses[src] += 1.0;
+        uses[dst] += 1.0;
+      }
+    }
+
+    auto spoke = std::vector<double>(k_, 0.0);
+    auto link_cost = std::vector<double>(links.size());
+    for (auto i = std::size_t{0U}; i != k_; ++i) {
+      if (cell_of[i] != kNone) {
+        spoke[i] = result.cost_[cell_of[i]] / 2.0;
+      }
+    }
+    for (auto e = std::size_t{0U}; e != links.size(); ++e) {
+      link_cost[e] =
+          (result.cost_[links[e].first] + result.cost_[links[e].second]) / 2.0;
+    }
+
+    auto link = std::vector<double>(m * m);
+    auto dist = std::vector<double>(m * m);
+    auto pred = std::vector<std::size_t>(m * m);
+    auto const derive = [&]() {
+      std::ranges::fill(link, kInf);
+      for (auto e = std::size_t{0U}; e != links.size(); ++e) {
+        auto const [a, b] = links[e];
+        link[a * m + b] = link[b * m + a] = link_cost[e];
+      }
+      for (auto src = std::size_t{0U}; src != m; ++src) {
+        link_paths(m, link, src, &dist[src * m], &pred[src * m]);
+      }
+    };
+    // The columns of pair p's current route: both spokes, then its links.
+    auto const route_of = [&](need const& p) {
+      auto cols = std::vector<HighsInt>{static_cast<HighsInt>(p.i_),
+                                        static_cast<HighsInt>(p.j_)};
+      for (auto v = p.b_; v != p.a_; v = pred[p.a_ * m + v]) {
+        cols.push_back(
+            static_cast<HighsInt>(k_ + link_of[pred[p.a_ * m + v] * m + v]));
+      }
+      return cols;
+    };
+
+    struct bound {
+      std::vector<HighsInt> cols_;
+      double geodesic_;
+    };
+    auto floors = std::vector<bound>{};
+    auto const ones = std::vector<double>(n_cols, 1.0);
+
+    // Solves, adding floors as they turn out to be needed. False if the
+    // solver fails.
+    auto const solve = [&](Highs& h) {
+      for (auto lp_round = 0;; ++lp_round) {
+        if (lp_round == kMaxLpRounds || h.run() != HighsStatus::kOk ||
+            h.getModelStatus() != HighsModelStatus::kOptimal) {
+          return false;
+        }
+        auto const& solution = h.getSolution().col_value;
+        for (auto i = std::size_t{0U}; i != k_; ++i) {
+          spoke[i] = std::max(0.0, solution[i]);
+        }
+        for (auto e = std::size_t{0U}; e != links.size(); ++e) {
+          link_cost[e] = std::max(0.0, solution[k_ + e]);
+        }
+        derive();
+        auto added = false;
+        for (auto const& p : pairs) {
+          auto const hubs = dist[p.a_ * m + p.b_];
+          if (hubs == kInf ||
+              spoke[p.i_] + spoke[p.j_] + hubs >=
+                  p.geodesic_ - kMaxUnderpricing) {
+            continue;
+          }
+          auto const& b = floors.emplace_back(
+              bound{.cols_ = route_of(p), .geodesic_ = p.geodesic_});
+          h.addRow(b.geodesic_, kHighsInf, static_cast<HighsInt>(b.cols_.size()),
+                   b.cols_.data(), ones.data());
+          added = true;
+        }
+        if (!added) {
+          return true;
+        }
+      }
+    };
+
+    auto weight = std::vector<double>(n_cols);
+    for (auto round = 0; round != kMaxFitRounds; ++round) {
+      // The overpricing summed along the routes the costs give now is, up to
+      // a constant, each spoke's cost times the pairs using it, plus each
+      // link's times the pairs routed over it.
+      derive();
+      std::ranges::fill(weight, kTieBreak);
+      for (auto i = std::size_t{0U}; i != k_; ++i) {
+        weight[i] += uses[i];
+      }
+      for (auto const& p : pairs) {
+        if (dist[p.a_ * m + p.b_] != kInf) {
+          for (auto const c : route_of(p)) {
+            if (static_cast<std::size_t>(c) >= k_) {
+              weight[static_cast<std::size_t>(c)] += 1.0;
+            }
+          }
+        }
+      }
+      if (worst_case) {
+        weight[t] = 0.0;
+      }
+
+      auto lp = HighsLp{};
+      lp.num_col_ = static_cast<HighsInt>(n_cols);
+      lp.num_row_ = 0;
+      lp.col_cost_ = weight;
+      lp.col_lower_.assign(n_cols, 0.0);
+      lp.col_upper_.assign(n_cols, kHighsInf);
+      lp.a_matrix_.format_ = MatrixFormat::kColwise;
+      lp.a_matrix_.num_col_ = lp.num_col_;
+      lp.a_matrix_.num_row_ = 0;
+      lp.a_matrix_.start_.assign(n_cols + 1U, 0);
+      lp.sense_ = ObjSense::kMinimize;
+
+      auto h = Highs{};
+      h.setOptionValue("output_flag", false);
+      if (h.passModel(std::move(lp)) != HighsStatus::kOk) {
+        return result;
+      }
+      for (auto const& b : floors) {
+        h.addRow(b.geodesic_, kHighsInf, static_cast<HighsInt>(b.cols_.size()),
+                 b.cols_.data(), ones.data());
+      }
+
+      if (worst_case) {
+        // Ceilings: every pair's route costs at most its geodesic plus t.
+        for (auto const& p : pairs) {
+          if (dist[p.a_ * m + p.b_] == kInf) {
+            continue;
+          }
+          auto cols = route_of(p);
+          cols.push_back(static_cast<HighsInt>(t));
+          auto coef = std::vector<double>(cols.size(), 1.0);
+          coef.back() = -1.0;
+          h.addRow(-kHighsInf, p.geodesic_, static_cast<HighsInt>(cols.size()),
+                   cols.data(), coef.data());
+        }
+
+        // First the smallest worst case ...
+        auto only_t = std::vector<double>(n_cols, kTieBreak);
+        only_t[t] = 1.0;
+        h.changeColsCost(0, static_cast<HighsInt>(n_cols) - 1, only_t.data());
+        if (!solve(h)) {
+          return result;
+        }
+
+        // ... then, holding it, the least overpricing overall. The worst
+        // case's solution meets every floor found since, so this stays
+        // feasible.
+        auto const worst = h.getSolution().col_value[t];
+        h.changeColBounds(static_cast<HighsInt>(t), 0.0,
+                          worst + 1e-6 * std::max(1.0, worst));
+        h.changeColsCost(0, static_cast<HighsInt>(n_cols) - 1, weight.data());
+      }
+      if (!solve(h)) {
+        return result;
+      }
+    }
+
+    result.spoke_ = spoke;
+    result.link_ = link;
+    for (auto ci = std::size_t{0U}; ci != m; ++ci) {
+      auto const& conns = nodes_[f.owner_[ci]].connectors_;
+      auto sum = 0.0;
+      for (auto const c : conns) {
+        sum += spoke[c];
+      }
+      result.cost_[ci] =
+          conns.empty() ? 0.0 : 2.0 * sum / static_cast<double>(conns.size());
+    }
+    std::ranges::fill(result.violations_, 0);
+    for (auto const& p : pairs) {
+      auto const hubs = dist[p.a_ * m + p.b_];
+      if (hubs == kInf || p.geodesic_ < kMinPairDistance ||
+          std::abs(spoke[p.i_] + spoke[p.j_] + hubs - p.geodesic_) <=
+              threshold) {
+        continue;
+      }
+      for (auto v = p.b_;; v = pred[p.a_ * m + v]) {
+        ++result.violations_[v];
+        if (v == p.a_) {
+          break;
+        }
+      }
+    }
+    return result;
+  }
+
+  // Refits `cost` so that no pair's route costs less than its geodesic, with
+  // as little overpricing along the routes taken as that allows.
+  //
+  // A route costs the sum of the costs of the cells it passes, which is linear
+  // in them, so this is a linear program: minimise the costs weighted by how
+  // many pairs are routed through each cell, subject to every cell path
+  // between two cells costing at least the longest geodesic between their
+  // connectors. There is a constraint for every path; they are added as they
+  // are needed - solve, find the cell pairs whose cheapest path is still too
+  // cheap, add those paths, solve again. The routes follow the costs, so the
+  // weights are rederived from them for a few rounds, like the least-squares
+  // fit's routes. If the solver fails, `cost` is left as it was.
+  void no_underpricing(std::size_t const m,
+                       std::vector<std::uint64_t> const& neighbours,
+                       std::vector<std::size_t> const& cell_of,
+                       std::vector<double>& cost) const {
+    // What each cell pair has to cover, and how many connector pairs it
+    // carries. Every pair counts, however short: the router may take any.
+    auto need = std::vector<double>(m * m, 0.0);
+    auto n_pairs = std::vector<double>(m * m, 0.0);
+    for (auto src = std::size_t{0U}; src != k_; ++src) {
+      for (auto dst = src + 1U; dst != k_; ++dst) {
+        auto const truth = distance(src, dst);
+        auto const a = std::min(cell_of[src], cell_of[dst]);
+        auto const b = std::max(cell_of[src], cell_of[dst]);
+        if (truth == area_geodesics::kUnreachable || b == kNone) {
+          continue;
+        }
+        need[a * m + b] = std::max(need[a * m + b], static_cast<double>(truth));
+        n_pairs[a * m + b] += 1.0;
+      }
+    }
+
+    auto lp = HighsLp{};
+    lp.num_col_ = static_cast<HighsInt>(m);
+    lp.num_row_ = 0;
+    lp.col_cost_.assign(m, kTieBreak);
+    lp.col_lower_.resize(m);
+    lp.col_upper_.assign(m, kHighsInf);
+    for (auto a = std::size_t{0U}; a != m; ++a) {
+      lp.col_lower_[a] = need[a * m + a];  // a pair inside one cell
+    }
+    lp.a_matrix_.format_ = MatrixFormat::kColwise;
+    lp.a_matrix_.num_col_ = lp.num_col_;
+    lp.a_matrix_.num_row_ = 0;
+    lp.a_matrix_.start_.assign(m + 1U, 0);
+    lp.sense_ = ObjSense::kMinimize;
+
+    auto h = Highs{};
+    h.setOptionValue("output_flag", false);
+    if (h.passModel(std::move(lp)) != HighsStatus::kOk) {
+      return;
+    }
+
+    auto c = cost;
+    for (auto a = std::size_t{0U}; a != m; ++a) {
+      c[a] = std::max(c[a], need[a * m + a]);
+    }
+    auto dist = std::vector<double>(m * m);
+    auto pred = std::vector<std::size_t>(m * m);
+    auto const derive = [&]() {
+      for (auto src = std::size_t{0U}; src != m; ++src) {
+        cell_paths(m, neighbours, c, src, &dist[src * m], &pred[src * m]);
+      }
+    };
+    auto path = std::vector<HighsInt>{};
+    auto const route = [&](std::size_t const a, std::size_t const b) {
+      path.clear();
+      for (auto v = b; v != kNone; v = (v == a ? kNone : pred[a * m + v])) {
+        path.push_back(static_cast<HighsInt>(v));
+      }
+    };
+    auto const ones = std::vector<double>(m, 1.0);
+
+    for (auto round = 0; round != kMaxFitRounds; ++round) {
+      // The overpricing along the routes the costs give now is, up to a
+      // constant, each cell's cost times the pairs routed through it.
+      derive();
+      auto weight = std::vector<double>(m, kTieBreak);
+      for (auto a = std::size_t{0U}; a != m; ++a) {
+        weight[a] += n_pairs[a * m + a];
+        for (auto b = a + 1U; b != m; ++b) {
+          if (n_pairs[a * m + b] != 0.0 && dist[a * m + b] != kInf) {
+            route(a, b);
+            for (auto const x : path) {
+              weight[static_cast<std::size_t>(x)] += n_pairs[a * m + b];
+            }
+          }
+        }
+      }
+      h.changeColsCost(0, static_cast<HighsInt>(m) - 1, weight.data());
+
+      for (auto lp_round = 0;; ++lp_round) {
+        if (lp_round == kMaxLpRounds || h.run() != HighsStatus::kOk ||
+            h.getModelStatus() != HighsModelStatus::kOptimal) {
+          return;
+        }
+        auto const& solution = h.getSolution().col_value;
+        for (auto a = std::size_t{0U}; a != m; ++a) {
+          c[a] = std::max(0.0, solution[a]);
+        }
+        derive();
+        auto added = false;
+        for (auto a = std::size_t{0U}; a != m; ++a) {
+          for (auto b = a + 1U; b != m; ++b) {
+            if (n_pairs[a * m + b] != 0.0 &&
+                dist[a * m + b] < need[a * m + b] - kMaxUnderpricing) {
+              route(a, b);
+              h.addRow(need[a * m + b], kHighsInf,
+                       static_cast<HighsInt>(path.size()), path.data(),
+                       ones.data());
+              added = true;
+            }
+          }
+        }
+        if (!added) {
+          break;
+        }
+      }
+    }
+    cost = c;
+  }
+
   std::vector<geo::latlng> const& pos_;
   std::vector<float> const& dist_;
   std::vector<bool> const& relevant_;
   std::size_t k_;
   std::vector<cut_node> nodes_;
+  std::size_t min_split_{4U};  // see area_cells_params
 };
 
 // Smallest enclosing circle, in a local metric plane.
@@ -898,6 +1345,138 @@ std::vector<float> area_cells::cell_distances() const {
   return {begin(dist), end(dist)};
 }
 
+void area_cells::set_link(cell_idx_t const a,
+                          cell_idx_t const b,
+                          float const cost) {
+  auto const m = n_cells();
+  link_.resize(m < 2U ? 0U : m * (m - 1U) / 2U, 0.F);
+  link_[bit_index(m, a, b)] = cost;
+}
+
+float area_cells::spoke_cost(std::size_t const i) const {
+  return spoke_.empty() ? cost_[connector_cell_[i]] / 2.F : spoke_[i];
+}
+
+float area_cells::link_cost(cell_idx_t const a, cell_idx_t const b) const {
+  return link_.empty() ? (cost_[a] + cost_[b]) / 2.F
+                       : link_[bit_index(n_cells(), a, b)];
+}
+
+// Everything the direct edges reach, folded into the hub distances: a
+// crossing may run connector -> hubs -> a direct edge -> hubs -> connector,
+// possibly through several of them. There are only a handful, so the work
+// goes through their endpoints rather than over the whole matrix.
+void apply_direct_edges(
+    std::vector<area_cells::direct_edge> const& direct,
+    std::size_t const k,
+    std::vector<float>& out) {
+  if (direct.empty()) {
+    return;
+  }
+  auto ends = std::vector<std::size_t>{};
+  for (auto const& d : direct) {
+    ends.push_back(d.a_);
+    ends.push_back(d.b_);
+  }
+  std::ranges::sort(ends);
+  ends.erase(std::ranges::unique(ends).begin(), end(ends));
+  auto const t = ends.size();
+
+  // Between the endpoints: the model as it stands, or a direct edge.
+  auto between = std::vector<double>(t * t, kInf);
+  auto const slot = [&](std::size_t const v) {
+    return static_cast<std::size_t>(
+        std::ranges::lower_bound(ends, v) - begin(ends));
+  };
+  for (auto u = std::size_t{0U}; u != t; ++u) {
+    between[u * t + u] = 0.0;
+    for (auto v = std::size_t{0U}; v != t; ++v) {
+      auto const d = out[ends[u] * k + ends[v]];
+      if (u != v && std::isfinite(d)) {
+        between[u * t + v] = d;
+      }
+    }
+  }
+  for (auto const& d : direct) {
+    auto const u = slot(d.a_);
+    auto const v = slot(d.b_);
+    between[u * t + v] = std::min(between[u * t + v], double{d.cost_});
+    between[v * t + u] = between[u * t + v];
+  }
+  for (auto w = std::size_t{0U}; w != t; ++w) {
+    for (auto u = std::size_t{0U}; u != t; ++u) {
+      for (auto v = std::size_t{0U}; v != t; ++v) {
+        between[u * t + v] = std::min(between[u * t + v],
+                                      between[u * t + w] + between[w * t + v]);
+      }
+    }
+  }
+
+  // To each endpoint from every connector, then on to the other side.
+  auto reach = std::vector<double>(k * t, kInf);
+  for (auto i = std::size_t{0U}; i != k; ++i) {
+    for (auto u = std::size_t{0U}; u != t; ++u) {
+      for (auto v = std::size_t{0U}; v != t; ++v) {
+        auto const to_v = out[i * k + ends[v]];
+        if (std::isfinite(to_v) && between[v * t + u] != kInf) {
+          reach[i * t + u] = std::min(reach[i * t + u], to_v + between[v * t + u]);
+        }
+      }
+    }
+  }
+  for (auto i = std::size_t{0U}; i != k; ++i) {
+    for (auto j = std::size_t{0U}; j != k; ++j) {
+      if (i == j) {
+        continue;
+      }
+      auto best = double{out[i * k + j]};
+      for (auto u = std::size_t{0U}; u != t; ++u) {
+        auto const from_u = out[ends[u] * k + j];
+        if (reach[i * t + u] != kInf && std::isfinite(from_u)) {
+          best = std::min(best, reach[i * t + u] + from_u);
+        }
+      }
+      out[i * k + j] = static_cast<float>(best);
+    }
+  }
+}
+
+std::vector<float> area_cells::connector_distances() const {
+  auto const k = n_connectors();
+  auto const m = n_cells();
+  auto link = std::vector<double>(m * m, kInf);
+  for (auto a = std::size_t{0U}; a != m; ++a) {
+    for (auto b = a + 1U; b != m; ++b) {
+      auto const x = static_cast<cell_idx_t>(a);
+      auto const y = static_cast<cell_idx_t>(b);
+      if (is_neighbour(x, y)) {
+        link[a * m + b] = link[b * m + a] = link_cost(x, y);
+      }
+    }
+  }
+  auto hubs = std::vector<double>(m * m);
+  auto pred = std::vector<std::size_t>(m * m);
+  for (auto src = std::size_t{0U}; src != m; ++src) {
+    link_paths(m, link, src, &hubs[src * m], &pred[src * m]);
+  }
+
+  auto out = std::vector<float>(k * k, std::numeric_limits<float>::infinity());
+  for (auto i = std::size_t{0U}; i != k; ++i) {
+    for (auto j = std::size_t{0U}; j != k; ++j) {
+      auto const a = connector_cell_[i];
+      auto const b = connector_cell_[j];
+      if (i == j) {
+        out[i * k + j] = 0.F;
+      } else if (a != kNoCell && b != kNoCell && hubs[a * m + b] != kInf) {
+        out[i * k + j] = static_cast<float>(spoke_cost(i) + hubs[a * m + b] +
+                                            spoke_cost(j));
+      }
+    }
+  }
+  apply_direct_edges(direct_, k, out);
+  return out;
+}
+
 namespace {
 
 // One walkable part: every pair of `connectors` reachable.
@@ -912,7 +1491,8 @@ area_cells build_part(
                    .dist_ = dist,
                    .relevant_ = relevant,
                    .k_ = k,
-                   .nodes_ = {}};
+                   .nodes_ = {},
+                   .min_split_ = params.min_split_};
   auto& root = b.nodes_.emplace_back();
   root.connectors_.resize(k);
   for (auto i = std::size_t{0U}; i != k; ++i) {
@@ -931,7 +1511,11 @@ area_cells build_part(
     f = frontier{};
     b.collect(0U, f);
     b.add_shared_borders(f, rings);
-    result = b.fit_costs(f, params.threshold_);
+    result = params.fit_ == cost_fit::kSpokes ||
+                     params.fit_ == cost_fit::kSpokesWorstCase
+                 ? b.fit_spokes(f, params.threshold_,
+                                params.fit_ == cost_fit::kSpokesWorstCase)
+                 : b.fit_costs(f, params.threshold_, params.fit_);
 
     // Out of rounds, and this does happen: the fit is global, so a cell that
     // was within the threshold can start missing after a later refit. Keep
@@ -965,6 +1549,14 @@ area_cells build_part(
   cells.neighbours_.assign(n_words(m), 0U);
   for (auto const& [x, y] : f.neighbours_) {
     set_bit(cells.neighbours_, bit_index(m, x, y));
+  }
+  if (!result.spoke_.empty()) {
+    cells.spoke_.assign(begin(result.spoke_), end(result.spoke_));
+    for (auto const& [x, y] : f.neighbours_) {
+      cells.set_link(static_cast<area_cells::cell_idx_t>(x),
+                     static_cast<area_cells::cell_idx_t>(y),
+                     static_cast<float>(result.link_[x * m + y]));
+    }
   }
   if (cell_regions != nullptr) {
     auto path = std::vector<area_cut_side>{};
@@ -1030,6 +1622,16 @@ std::optional<area_cells> build_area_cells(
   auto cells = area_cells{};
   cells.connector_cell_.assign(k, area_cells::kNoCell);
   auto neighbours = std::vector<std::pair<std::size_t, std::size_t>>{};
+  struct link_entry {
+    std::size_t a_, b_;
+    float cost_;
+  };
+  auto links = std::vector<link_entry>{};
+  auto const spokes = params.fit_ == cost_fit::kSpokes ||
+                      params.fit_ == cost_fit::kSpokesWorstCase;
+  if (spokes) {
+    cells.spoke_.assign(k, 0.F);
+  }
   for (auto const& part : parts) {
     auto const n = part.size();
     if (n < 2U) {
@@ -1060,11 +1662,23 @@ std::optional<area_cells> build_area_cells(
           offset + sub.connector_cell_[a]);
     }
     cells.cost_.insert(end(cells.cost_), begin(sub.cost_), end(sub.cost_));
+    // Through the accessors, so a part the solver failed on - and that kept
+    // its flat costs - joins as its flat costs' spokes and links.
+    if (spokes) {
+      for (auto a = std::size_t{0U}; a != n; ++a) {
+        cells.spoke_[part[a]] = sub.spoke_cost(a);
+      }
+    }
     for (auto x = std::size_t{0U}; x != sub.n_cells(); ++x) {
       for (auto y = x + 1U; y != sub.n_cells(); ++y) {
-        if (sub.is_neighbour(static_cast<area_cells::cell_idx_t>(x),
-                             static_cast<area_cells::cell_idx_t>(y))) {
+        auto const cx = static_cast<area_cells::cell_idx_t>(x);
+        auto const cy = static_cast<area_cells::cell_idx_t>(y);
+        if (sub.is_neighbour(cx, cy)) {
           neighbours.emplace_back(offset + x, offset + y);
+          if (spokes) {
+            links.push_back(
+                {.a_ = offset + x, .b_ = offset + y, .cost_ = sub.link_cost(cx, cy)});
+          }
         }
       }
     }
@@ -1076,6 +1690,47 @@ std::optional<area_cells> build_area_cells(
   cells.neighbours_.assign(n_words(cells.n_cells()), 0U);
   for (auto const& [x, y] : neighbours) {
     set_bit(cells.neighbours_, bit_index(cells.n_cells(), x, y));
+  }
+  for (auto const& l : links) {
+    cells.set_link(static_cast<area_cells::cell_idx_t>(l.a_),
+                   static_cast<area_cells::cell_idx_t>(l.b_), l.cost_);
+  }
+
+  // The pairs the cells price worst, kept exactly. Only pairs a crossing
+  // shortens are worth an edge, and only where the model is well off: a
+  // connector's spoke covers its most distant partner, so a nearby pair can
+  // come out many times its true length, and the router would refuse a
+  // crossing it should take.
+  if (params.direct_edges_ != 0U) {
+    auto const model = cells.connector_distances();
+    auto worst = std::vector<std::pair<double, std::pair<std::uint32_t,
+                                                         std::uint32_t>>>{};
+    for (auto i = std::size_t{0U}; i != k; ++i) {
+      for (auto j = i + 1U; j != k; ++j) {
+        auto const truth = static_cast<double>(dist[i * k + j]);
+        if (!relevant[i * k + j] ||
+            dist[i * k + j] == area_geodesics::kUnreachable ||
+            !std::isfinite(model[i * k + j])) {
+          continue;
+        }
+        if (auto const e = model[i * k + j] - truth;
+            e > std::max(kDirectMinError, kDirectMinShare * truth)) {
+          worst.emplace_back(e, std::pair{static_cast<std::uint32_t>(i),
+                                          static_cast<std::uint32_t>(j)});
+        }
+      }
+    }
+    std::ranges::sort(worst, std::greater<>{});
+    worst.resize(std::min(worst.size(), params.direct_edges_));
+    for (auto const& [e, p] : worst) {
+      cells.direct_.push_back({.a_ = p.first,
+                               .b_ = p.second,
+                               .cost_ = dist[p.first * k + p.second]});
+    }
+    std::ranges::sort(cells.direct_, [](area_cells::direct_edge const& x,
+                                        area_cells::direct_edge const& y) {
+      return std::pair{x.a_, x.b_} < std::pair{y.a_, y.b_};
+    });
   }
   return cells;
 }

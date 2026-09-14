@@ -197,3 +197,45 @@ TEST(area_geodesic, connector_outside_stays_unreachable) {
   EXPECT_TRUE(g.path(0, 1).empty());
   EXPECT_FALSE(g.is_connector_reachable(1));
 }
+
+TEST(area_geodesic, keeps_off_the_walls) {
+  // Across the square with the hole, now keeping kWallClearance off every
+  // wall: each entrance steps in from the outline, and the path turns that
+  // far (plus the millimetre everything blocked is grown by) off the hole's
+  // corners.
+  auto const with_hole = std::vector<std::vector<geo::latlng>>{
+      {at(0, 0), at(100, 0), at(100, 100), at(0, 100)},
+      {at(40, 40), at(60, 40), at(60, 60), at(40, 60)}};
+  auto const g = area_geodesics{with_hole, {at(0, 50), at(100, 50)}, {},
+                                {.clearance_ = kWallClearance}};
+
+  auto const r = kWallClearance;
+  auto const h = r + 1e-3;  // off the hole
+  auto const expected = 2.0 * r +
+                        2.0 * std::hypot(40.0 - h - r, 10.0 + h) +
+                        (20.0 + 2.0 * h);
+  EXPECT_NEAR(expected, g.distance(0, 1), 0.01);
+
+  // The path starts and ends at the entrances themselves, then steps in.
+  auto const path = g.path(0, 1);
+  ASSERT_EQ(6U, path.size());
+  EXPECT_NEAR(0.0, geo::distance(at(0, 50), path.front()), 1e-3);
+  EXPECT_NEAR(r, geo::distance(at(0, 50), path[1]), 1e-3);
+  EXPECT_NEAR(0.0, geo::distance(at(100, 50), path.back()), 1e-3);
+}
+
+TEST(area_geodesic, a_gap_narrower_than_twice_the_clearance_closes) {
+  auto const square = std::vector<geo::latlng>{at(0, 0), at(100, 0),
+                                               at(100, 100), at(0, 100)};
+  auto const across = [&](double const gap) {
+    auto const rings = std::vector<std::vector<geo::latlng>>{
+        square,
+        {at(0, 40), at(50 - gap / 2, 40), at(50 - gap / 2, 60), at(0, 60)},
+        {at(50 + gap / 2, 40), at(100, 40), at(100, 60), at(50 + gap / 2, 60)}};
+    return area_geodesics{rings, {at(50, 10), at(50, 90)}, {},
+                          {.clearance_ = kWallClearance}}
+        .distance(0, 1);
+  };
+  EXPECT_EQ(area_geodesics::kUnreachable, across(0.4));
+  EXPECT_NEAR(80.0, across(0.6), 0.01);
+}

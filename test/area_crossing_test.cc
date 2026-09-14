@@ -105,8 +105,11 @@ TEST(area_crossing, a_crossing_is_drawn_round_the_building) {
   EXPECT_EQ(level_t{0.F}, c.level_);
   EXPECT_NEAR(100.0, c.model_distance_, 0.01);
 
-  // Round a corner of the building: 2 * hypot(40, 10) + 20.
-  EXPECT_NEAR(2.0 * std::hypot(40.0, 10.0) + 20.0, c.geodesic_distance_, 0.1);
+  // Round two corners of the building: 2 * hypot(40, 10) + 20 right along
+  // its walls, a little more keeping kWallClearance off them.
+  auto const ideal = 2.0 * std::hypot(40.0, 10.0) + 20.0;
+  EXPECT_GT(c.geodesic_distance_, ideal);
+  EXPECT_LT(c.geodesic_distance_, ideal + 1.0);
   ASSERT_GE(c.geodesic_.size(), 3U);
   EXPECT_NEAR(0.0, geo::distance(at(0, 50), c.geodesic_.front()), 0.01);
   EXPECT_NEAR(0.0, geo::distance(at(100, 50), c.geodesic_.back()), 0.01);
@@ -116,6 +119,36 @@ TEST(area_crossing, a_crossing_is_drawn_round_the_building) {
     EXPECT_FALSE(inside_building({0.5 * (a.lat() + b.lat()),
                                   0.5 * (a.lng() + b.lng())}));
   }
+}
+
+TEST(area_crossing, spoke_costs_reach_the_routing_graph) {
+  // One cell, flat cost 100: each spoke would cost 50. With costs per
+  // connector, W's spoke costs 30 and E's 70.
+  auto in = plaza_cells(1U);
+  in.cells_.spoke_ = {30.F, 70.F};
+  auto const g = area_graph{100U, {in}, fake_lookup};
+  auto const s = g.sharing();
+  auto const& from_w = s.additional_edges_.at(node_idx_t{5U});
+  auto const& from_e = s.additional_edges_.at(node_idx_t{6U});
+  ASSERT_EQ(1U, from_w.size());
+  ASSERT_EQ(1U, from_e.size());
+  EXPECT_EQ(node_idx_t{100U}, from_w[0].to_);
+  EXPECT_EQ(30U, from_w[0].distance_);
+  EXPECT_EQ(70U, from_e[0].distance_);
+}
+
+TEST(area_crossing, a_direct_edge_reaches_the_routing_graph) {
+  // W and E kept exactly at 42 m, on top of their spokes through the hub.
+  auto in = plaza_cells(1U);
+  in.cells_.direct_.push_back({.a_ = 0U, .b_ = 1U, .cost_ = 42.F});
+  auto const g = area_graph{100U, {in}, fake_lookup};
+  auto const s = g.sharing();
+  auto const& from_w = s.additional_edges_.at(node_idx_t{5U});
+  auto const direct = std::ranges::find_if(from_w, [](auto const& e) {
+    return e.to_ == node_idx_t{6U};
+  });
+  ASSERT_NE(end(from_w), direct);
+  EXPECT_EQ(42U, direct->distance_);
 }
 
 TEST(area_crossing, the_drawn_path_walks_the_line) {
@@ -131,7 +164,8 @@ TEST(area_crossing, the_drawn_path_walks_the_line) {
   EXPECT_EQ(node_idx_t{5U}, drawn.segments_[1].from_);
   EXPECT_EQ(node_idx_t{6U}, drawn.segments_[1].to_);
   EXPECT_EQ(d.crossings(p).front().geodesic_, drawn.segments_[1].polyline_);
-  EXPECT_EQ(102U, drawn.segments_[1].dist_);
+  EXPECT_NEAR(d.crossings(p).front().geodesic_distance_,
+              static_cast<double>(drawn.segments_[1].dist_), 1.0);
   EXPECT_EQ(cost_t{100U}, drawn.segments_[1].cost_);
   EXPECT_EQ(node_idx_t{7U}, drawn.segments_[2].to_);  // untouched
   EXPECT_DOUBLE_EQ(120.0, drawn.dist_);  // the router's totals stay

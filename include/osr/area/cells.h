@@ -53,18 +53,47 @@ struct area_cells {
 
   // For rebuilding a stored subdivision: cost_ has to be set first.
   void set_neighbour(cell_idx_t a, cell_idx_t b);
+  void set_link(cell_idx_t a, cell_idx_t b, float cost);
 
-  // n_cells() x n_cells(), row-major: the modelled cost of entering the area
-  // in cell `a` and leaving it in cell `b` - the sum of the costs of the cells
-  // on the cheapest cell path, both ends included. The diagonal is each cell's
-  // own cost. Infinite where no cell path exists.
+  // What the spoke from connector `i` to its hub costs, and the link between
+  // two neighbouring hubs. From spoke_ and link_ where they are set, else from
+  // the flat costs: half the cell's cost, half the sum of the two cells'.
+  float spoke_cost(std::size_t i) const;
+  float link_cost(cell_idx_t a, cell_idx_t b) const;
+
+  // n_connectors() x n_connectors(), row-major: the modelled cost of crossing
+  // from connector i to connector j - its spoke, the cheapest hub path, the
+  // other spoke, or any cheaper way through the direct edges. Zero on the
+  // diagonal; infinite where no path exists or a connector has no cell. This
+  // is the model, whichever costs it has.
+  std::vector<float> connector_distances() const;
+
+  // n_cells() x n_cells(), row-major, for the flat costs only: the modelled
+  // cost of entering the area in cell `a` and leaving it in cell `b` - the sum
+  // of the costs of the cells on the cheapest cell path, both ends included.
+  // The diagonal is each cell's own cost. Infinite where no cell path exists.
   std::vector<float> cell_distances() const;
 
   // The cell each connector belongs to, or kNoCell.
   std::vector<cell_idx_t> connector_cell_;
 
-  // Flat crossing cost of each cell, in meters.
+  // Flat crossing cost of each cell, in meters. With spoke_ set, only a
+  // summary for drawing: twice the mean spoke of the cell's connectors.
   std::vector<float> cost_;
+
+  // Per-connector costs (cost_fit::kSpokes); both empty for the flat model.
+  // Each connector's spoke, and each link indexed like the neighbour bits.
+  std::vector<float> spoke_;
+  std::vector<float> link_;
+
+  // A pair of connectors the cells price badly, kept exactly: the walk
+  // between them at its true distance. Since that is a walk that exists, it
+  // can only bring a modelled crossing down to the truth, never below it.
+  struct direct_edge {
+    std::uint32_t a_{0U}, b_{0U};
+    float cost_{0.F};
+  };
+  std::vector<direct_edge> direct_;
 
   // The strict upper triangle (a < b) of the symmetric neighbour matrix,
   // row-major, packed into bits: n_cells() * (n_cells() - 1) / 2 of them.
@@ -88,6 +117,27 @@ struct area_cut_side {
   bool below_{true};
 };
 
+// How the cell costs are fitted to the geodesics.
+enum class cost_fit : std::uint8_t {
+  // Least squares: small errors either way. The router picks the crossings
+  // priced too low, so routes come out optimistic.
+  kLeastSquares,
+
+  // No crossing priced below its geodesic, with as little overpricing along
+  // the routes taken as that allows: a linear program over the cell costs,
+  // solved with HiGHS.
+  kNoUnderpricing,
+
+  // As kNoUnderpricing, but with a cost per connector - its spoke to the hub
+  // - and per link between neighbouring hubs instead of one per cell, so a
+  // short crossing does not pay for the longest one in its cell.
+  kSpokes,
+
+  // As kSpokes, but minimising first the worst overpricing of any pair in the
+  // area, and only then, holding that, the overpricing overall.
+  kSpokesWorstCase
+};
+
 struct area_cells_params {
   // A cell is split while some route through it misses the geodesic by more
   // than this many meters - so it bounds an error the router sees, not a
@@ -103,6 +153,19 @@ struct area_cells_params {
   // which always yields a tree - cells along the rest of a cut's line are
   // then not neighbours although they border each other.
   std::vector<std::vector<geo::latlng>> const* rings_{nullptr};
+
+  cost_fit fit_{cost_fit::kLeastSquares};
+
+  // Cells with fewer connectors than this are not split further. At 2, the
+  // cut tree may go down to one connector per cell.
+  std::size_t min_split_{4U};
+
+  // How many pairs an area may keep exactly, as direct edges between two
+  // connectors (see area_cells::direct_): the ones its cells price worst.
+  // A spoke has to cover its connector's most distant partner, so where one
+  // far connector exists every nearby pair inherits that; a handful of these
+  // edges per area is what the tail costs to remove.
+  std::size_t direct_edges_{0U};
 };
 
 // Subdivides an area and fits the cell costs.

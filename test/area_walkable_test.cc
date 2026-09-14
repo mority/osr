@@ -200,14 +200,14 @@ TEST(area_walkable, building_cut_out_twice_stays_cut_out) {
   ASSERT_EQ(1U, holes.size());
   EXPECT_NEAR(1600.0, area_m2(holes[0]), 1.0);
 
-  // A straight line through the building crosses its walls, which blocks it
-  // either way. The doubled hole fools the inside test where a line touches
-  // walls without crossing them: corner to corner, the diagonal counts as
-  // open ground.
+  // The geodesics no longer depend on it: they union the holes themselves, so
+  // the doubled hole is as solid as the clean one. (Under the old even-odd
+  // test, the diagonal from corner to corner - touching walls without crossing
+  // them - counted as open ground.)
   auto rings = std::vector<std::vector<geo::latlng>>{outer};
   rings.insert(end(rings), begin(holes), end(holes));
-  EXPECT_TRUE(area_geodesics::is_segment_inside({outer, galeria, galeria},
-                                                at(30, 30), at(70, 70)));
+  EXPECT_FALSE(area_geodesics::is_segment_inside({outer, galeria, galeria},
+                                                 at(30, 30), at(70, 70)));
   EXPECT_FALSE(area_geodesics::is_segment_inside(rings, at(30, 30), at(70, 70)));
 
   auto const clean = area_geodesics{rings, {at(50, 5), at(50, 95)}};

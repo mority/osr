@@ -18,8 +18,12 @@ crossing_drawer::crossing_drawer(area_graph const& graph,
 area_geodesics const& crossing_drawer::geodesics(std::size_t const area) const {
   auto& e = *areas_[area];
   std::call_once(e.once_, [&]() {
+    // Drawn paths keep kWallClearance off the walls - that is where people
+    // walk. What the router paid for the crossing comes from layers 3 and 4,
+    // which are fitted to the geodesics without it.
     e.geodesics_ = std::make_unique<area_geodesics>(
-        e.geometry_.rings_, e.geometry_.connectors_, e.geometry_.barriers_);
+        e.geometry_.rings_, e.geometry_.connectors_, e.geometry_.barriers_,
+        geodesic_options{.clearance_ = kWallClearance});
   });
   return *e.geodesics_;
 }
