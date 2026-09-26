@@ -51,6 +51,7 @@ struct one_to_many_state {
     cost_t before_min_;  // non-rental label preceding min_ (search order)
     cost_t after_max_;  // non-rental label following max_ (search order)
     cost_t dest_node_;  // destination node
+    cost_t dest_match_;  // final matching piece as reconstruct() shows it
   };
   virtual std::optional<rental_cost_info> rental_costs(
       std::size_t /* dest_idx */) const {

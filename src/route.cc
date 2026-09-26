@@ -875,7 +875,8 @@ struct one_to_many_state_impl final : public one_to_many_state {
                               .max_ = *max,
                               .before_min_ = before_min.value_or(0U),
                               .after_max_ = after_max,
-                              .dest_node_ = dest_cost};
+                              .dest_node_ = dest_cost,
+                              .dest_match_ = candidates_[k]->dest_nc_.cost_};
     } else {
       return std::nullopt;
     }
