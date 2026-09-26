@@ -34,12 +34,17 @@
 #include <cmath>
 #include <cstdint>
 
+#include <chrono>
 #include <algorithm>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
+
+#include "fmt/format.h"
 
 #include "utl/helpers/algorithm.h"
 #include "utl/verify.h"
@@ -52,6 +57,7 @@
 #include "osr/routing/path.h"
 #include "osr/routing/path_reconstruction.h"
 #include "osr/routing/profile.h"
+#include "osr/routing/route.h"
 #include "osr/routing/sharing_data.h"
 #include "osr/types.h"
 #include "osr/ways.h"
@@ -353,7 +359,7 @@ struct stage_base {
 
   virtual std::optional<seed_origin> origin_of(generic_node) const = 0;
 
-  // Every settled real node of this stage.
+  // Every node settled by the last `run()` of this stage, with its cost.
   virtual void for_each_settled(
       std::function<void(generic_node, cost_t)> const&) const = 0;
 
@@ -370,6 +376,9 @@ struct stage_base {
   virtual generic_node walk_preds(generic_node from,
                                   std::vector<path::segment>&,
                                   double& dist) const = 0;
+
+  // Root of the predecessor chain of `from` (no segments).
+  virtual generic_node root_of(generic_node from) const = 0;
 
   // Appends the segment for the edge `from` -> `to` of this stage's profile.
   virtual void add_edge_segment(generic_node from,
@@ -439,7 +448,11 @@ struct stage_impl final : public stage_base {
 
   bool has_pending() const override { return !d_.pq_.empty(); }
 
-  bool run() override { return d_.run(); }
+  bool run() override {
+    settled_.clear();
+    d_.settled_out_ = &settled_;
+    return d_.run();
+  }
 
   std::optional<std::pair<generic_node, cost_t>> min_cost_at(
       node_idx_t const n) const override {
@@ -535,22 +548,8 @@ struct stage_impl final : public stage_base {
 
   void for_each_settled(
       std::function<void(generic_node, cost_t)> const& f) const override {
-    auto const& r = *sp_.w_->r_;
-    for (auto const& [k, e] : d_.cost_) {
-      if constexpr (std::is_same_v<key, node>) {
-        auto const c = e.cost(k);
-        if (c != kInfeasible) {
-          f(to_generic<P>(k), c);
-        }
-      } else {
-        static_assert(std::is_same_v<key, node_idx_t>);
-        P::resolve_all(r, k, kNoLevel, [&](node const x) {
-          auto const c = e.cost(x);
-          if (c != kInfeasible) {
-            f(to_generic<P>(x), c);
-          }
-        });
-      }
+    for (auto const& x : settled_) {
+      f(to_generic<P>(x), d_.get_cost(x));
     }
   }
 
@@ -651,6 +650,17 @@ struct stage_impl final : public stage_base {
     return to_generic<P>(n);
   }
 
+  generic_node root_of(generic_node const from) const override {
+    auto n = from_generic<P>(from);
+    while (true) {
+      auto const pred = d_.cost_.at(n.get_key()).pred(n);
+      if (!pred.has_value()) {
+        return to_generic<P>(n);
+      }
+      n = *pred;
+    }
+  }
+
   void add_edge_segment(generic_node const from,
                         generic_node const to,
                         cost_t const expected_cost,
@@ -683,6 +693,7 @@ private:
   typename sp::parameters params_;
   stage_search_params sp_;
   dijkstra<sp> d_;
+  std::vector<node> settled_;  // by the last run()
   std::map<node, seed_origin, node_less> origins_;
 };
 
@@ -714,6 +725,39 @@ struct staged_search {
   }
 
   std::vector<std::optional<path>> const& results() const { return results_; }
+
+  // Wall time in milliseconds per stage run and per transition, summed over
+  // the start candidate iterations of the last `run()`.
+  std::map<std::string, std::uint64_t> const& timings_ms() const {
+    return timings_ms_;
+  }
+
+  // Keeps a copy of `s` alive as long as the search (transitions and
+  // reconstruction refer to sharing data by pointer).
+  sharing_data const& own(sharing_data const& s) {
+    owned_sharing_.push_back(s);
+    return owned_sharing_.back();
+  }
+
+  // Stage indices on the path to destination `k`, from the destination
+  // backwards to the start stage. Empty for unreachable and direct paths.
+  std::vector<std::size_t> stages_on_path(std::size_t const k) const {
+    auto out = std::vector<std::size_t>{};
+    if (k >= dests_.size() || !dests_[k].has_value()) {
+      return out;
+    }
+    auto stage = dests_[k]->stage_;
+    auto g = dests_[k]->hit_.node_;
+    while (true) {
+      out.push_back(stage);
+      auto const origin = stages_[stage]->origin_of(stages_[stage]->root_of(g));
+      if (!origin.has_value()) {
+        return out;
+      }
+      stage = origin->from_stage_;
+      g = origin->from_node_;
+    }
+  }
 
   void run(ways const& w,
            location const& from,
@@ -757,6 +801,18 @@ struct staged_search {
     for (auto& s : stages_) {
       s->reset(params);
     }
+    timings_ms_.clear();
+    auto const timed = [&](std::string const& key, auto&& fn) {
+      auto const t0 = std::chrono::steady_clock::now();
+      fn();
+      timings_ms_[key] += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0)
+              .count());
+    };
+    auto const stage_key = [&](std::size_t const j) {
+      return fmt::format("stage_{}_{}", j, to_str(stages_[j]->get_mode()));
+    };
 
     auto const distance_lng_degrees =
         geo::approx_distance_lng_degrees(from.pos_);
@@ -766,6 +822,7 @@ struct staged_search {
       if (max_reached_ && component_seen(w, from_match, i)) {
         continue;
       }
+      ++timings_ms_["passes"];
       auto const start_way = from_match.way_[i];
       stages_[0]->add_start_candidate(start_way, from_match.left(i),
                                       from_match.lvl_);
@@ -778,14 +835,15 @@ struct staged_search {
       // Stages are in topological order: everything that can seed stage j
       // has finished before j runs. Re-running after new start candidates is
       // plain Dijkstra with additional sources (labels only improve).
-      max_reached_ |= !stages_[0]->run();
+      timed(stage_key(0), [&] { max_reached_ |= !stages_[0]->run(); });
       for (auto j = std::size_t{1U}; j != stages_.size(); ++j) {
         for (auto const& t : transitions_) {
           if (t.to_ == j) {
-            apply(t);
+            timed(fmt::format("transition_{}_{}", t.from_, t.to_),
+                  [&] { apply(t); });
           }
         }
-        max_reached_ |= !stages_[j]->run();
+        timed(stage_key(j), [&] { max_reached_ |= !stages_[j]->run(); });
       }
 
       for (auto k = std::size_t{0U}; k != results_.size(); ++k) {
@@ -1031,15 +1089,23 @@ private:
     }
 
     if (t.direct_switch_) {
+      auto n_settled = std::uint64_t{0U};
+      auto n_switch = std::uint64_t{0U};
       a.for_each_settled([&](generic_node const g, cost_t const c) {
+        ++n_settled;
         if (!is_allowed(t.allowed_, g.n_) ||
             (t.check_target_node_ && !b.node_feasible(g.n_))) {
           return;
         }
+        ++n_switch;
         max_reached_ |= b.seed_adjacent(
             g.n_, g.lvl_, c, t.penalty_,
             seed_origin{.from_stage_ = t.from_, .from_node_ = g});
       });
+      timings_ms_[fmt::format("transition_{}_{}_n_settled", t.from_, t.to_)] +=
+          n_settled;
+      timings_ms_[fmt::format("transition_{}_{}_n_switch", t.from_, t.to_)] +=
+          n_switch;
     }
   }
 
@@ -1079,6 +1145,7 @@ private:
   std::vector<std::unique_ptr<stage_base>> stages_;
   std::vector<bool> terminal_;
   std::vector<stage_transition> transitions_;
+  std::deque<sharing_data> owned_sharing_;
 
   ways const* w_{nullptr};
   location from_{};
@@ -1089,6 +1156,25 @@ private:
   bool max_reached_{false};
   std::vector<std::optional<path>> results_;
   std::vector<std::optional<dest_candidate>> dests_;
+  std::map<std::string, std::uint64_t> timings_ms_;
+};
+
+// `one_to_many_state` adapter: lets callers keep a finished staged search the
+// same way they keep a `route_one_to_many()` search. The `sharing_data`
+// passed to `reconstruct()` is ignored, the search owns what it needs.
+struct staged_one_to_many_state final : public one_to_many_state {
+  std::vector<std::optional<path>> const& results() const override {
+    return search_.results();
+  }
+
+  std::optional<path> reconstruct(ways const&,
+                                  lookup const& l,
+                                  std::size_t const dest_idx,
+                                  sharing_data const*) override {
+    return search_.reconstruct(l, dest_idx);
+  }
+
+  staged_search search_;
 };
 
 // Stage layout equivalent to bike_sharing / car_sharing for any number of

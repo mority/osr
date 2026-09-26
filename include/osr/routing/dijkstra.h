@@ -136,6 +136,9 @@ struct dijkstra {
 
       auto const curr = l.get_node();
       auto const curr_duration = cost_.at(curr.get_key()).duration(curr);
+      if (settled_out_ != nullptr) {
+        settled_out_->push_back(curr);
+      }
       P::template adjacent<SearchDir, WithBlocked>(
           params, r, w.timezones_, curr, curr_duration, start_time, blocked,
           sharing, elevations,
@@ -193,6 +196,10 @@ struct dijkstra {
   ankerl::unordered_dense::map<key, entry, hash> cost_;
   entry_storage_arena arena_;
   bool max_reached_{};
+
+  // Optional: every node settled by `run()` is appended here (a node can
+  // appear again if a later run improves it).
+  std::vector<node>* settled_out_{nullptr};
 
   // for early termination
   std::vector<node> destinations_;
