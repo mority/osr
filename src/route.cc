@@ -835,6 +835,52 @@ struct one_to_many_state_impl final : public one_to_many_state {
         c.dest_nc_, c.dest_node_, results_[k]->cost_, sp.dir_, sp.start_time_);
   }
 
+  std::optional<rental_cost_info> rental_costs(
+      std::size_t const k) const override {
+    if constexpr (requires(typename P::node n) { n.is_rental_node(); }) {
+      if (k >= results_.size() || !results_[k].has_value() ||
+          !candidates_[k].has_value()) {
+        return std::nullopt;
+      }
+      // Chain from the destination back to the search start: costs decrease.
+      auto const dest_cost = d_.get_cost(candidates_[k]->dest_node_);
+      auto min = std::optional<cost_t>{};
+      auto max = std::optional<cost_t>{};
+      auto before_min = std::optional<cost_t>{};
+      auto after_max = dest_cost;
+      auto prev_cost = dest_cost;  // label visited before (higher cost)
+      auto n = candidates_[k]->dest_node_;
+      while (true) {
+        auto const c = d_.get_cost(n);
+        if (n.is_rental_node()) {
+          if (!max.has_value()) {
+            max = c;
+            after_max = prev_cost;
+          }
+          min = c;
+        } else if (min.has_value() && !before_min.has_value()) {
+          before_min = c;
+        }
+        prev_cost = c;
+        auto const pred = d_.cost_.at(n.get_key()).pred(n);
+        if (!pred.has_value()) {
+          break;
+        }
+        n = *pred;
+      }
+      if (!min.has_value()) {
+        return std::nullopt;
+      }
+      return rental_cost_info{.min_ = *min,
+                              .max_ = *max,
+                              .before_min_ = before_min.value_or(0U),
+                              .after_max_ = after_max,
+                              .dest_node_ = dest_cost};
+    } else {
+      return std::nullopt;
+    }
+  }
+
   // The search owns everything it ran with (parameters, blocked, sharing,
   // elevations, direction, start time, the start location) - see
   // `osr::search_params`.

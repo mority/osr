@@ -39,6 +39,23 @@ struct one_to_many_state {
                                           lookup const&,
                                           std::size_t dest_idx,
                                           sharing_data const*) = 0;
+
+  // Sharing profiles: search costs (from the search start) of the first and
+  // the last rental label on the path to destination `dest_idx`, and of the
+  // destination's node (the path cost without the final matching). Walks
+  // the predecessor chain only, no geometry. nullopt if the path uses no
+  // vehicle (or the profile has none).
+  struct rental_cost_info {
+    cost_t min_;  // rental label closest to the search start
+    cost_t max_;  // rental label farthest from the search start
+    cost_t before_min_;  // non-rental label preceding min_ (search order)
+    cost_t after_max_;  // non-rental label following max_ (search order)
+    cost_t dest_node_;  // destination node
+  };
+  virtual std::optional<rental_cost_info> rental_costs(
+      std::size_t /* dest_idx */) const {
+    return std::nullopt;
+  }
 };
 
 std::unique_ptr<one_to_many_state> route_one_to_many(
