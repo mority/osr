@@ -109,8 +109,16 @@ struct dijkstra {
     return it != end(cost_) ? it->second.cost(n) : kInfeasible;
   }
 
-  template <direction SearchDir, bool WithBlocked>
-  bool run() {
+  // Always expands: `run()` without a filter.
+  struct expand_all {
+    constexpr bool operator()(label const&) const noexcept { return true; }
+  };
+
+  // `expand(label)` is called for every label taken from the queue that is
+  // not outdated; returning false skips its expansion (the label stays
+  // settled). Used to prune searches that run in parallel.
+  template <direction SearchDir, bool WithBlocked, typename Expand = expand_all>
+  bool run(Expand&& expand = Expand{}) {
     auto const& params = params_.profile_;
     auto const& w = params_.w();
     auto const& r = params_.r();
@@ -124,6 +132,10 @@ struct dijkstra {
       auto l = pq_.pop();
 
       if (get_cost(l.get_node()) < l.cost()) {
+        continue;
+      }
+
+      if (!expand(l)) {
         continue;
       }
 
@@ -206,15 +218,16 @@ struct dijkstra {
     return !max_reached_;
   }
 
-  bool run() {
+  template <typename Expand = expand_all>
+  bool run(Expand&& expand = Expand{}) {
     if (params_.blocked_ == nullptr) {
       return params_.dir_ == direction::kForward
-                 ? run<direction::kForward, false>()
-                 : run<direction::kBackward, false>();
+                 ? run<direction::kForward, false>(expand)
+                 : run<direction::kBackward, false>(expand);
     } else {
       return params_.dir_ == direction::kForward
-                 ? run<direction::kForward, true>()
-                 : run<direction::kBackward, true>();
+                 ? run<direction::kForward, true>(expand)
+                 : run<direction::kBackward, true>(expand);
     }
   }
 

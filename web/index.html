@@ -6,14 +6,53 @@
           content="Pedestrian routing, bike routing and car routing for OpenStreetMap"/>
     <meta charset='utf-8'>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- light and dark are handled here: no automatic darkening by the
+         browser (Chrome auto dark mode) or extensions (Dark Reader) -->
+    <meta name="color-scheme" content="light dark">
+    <meta name="darkreader-lock">
     <link rel='stylesheet'
           href='https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.css'/>
     <script src='https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.js'></script>
-    <script src="https://unpkg.com/maplibre-contour@0.0.5/dist/index.min.js"></script>
     <style>
+        :root {
+            --panel-bg: #fff;
+            --panel-fg: #000;
+            --panel-hover: #eee;
+            --active: #8fff7b;
+            --active-hover: #bdffb1;
+            /* keep in sync with zoneColors() */
+            --meet-fill: rgba(85, 85, 85, 0.45);
+            --meet-line: #222;
+            --total-fill: rgba(255, 255, 255, 0.55);
+            --total-line: #000;
+            --legend-near: rgba(0, 0, 0, 0.6);
+            --legend-far: rgba(0, 0, 0, 0.06);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --panel-bg: #2b2b2b;
+                --panel-fg: #eee;
+                --panel-hover: #3c3c3c;
+                --active: #2e6b25;
+                --active-hover: #3d8a31;
+                --meet-fill: rgba(0, 0, 0, 0.55);
+                --meet-line: #ddd;
+                --total-fill: rgba(255, 255, 255, 0.55);
+                --total-line: #fff;
+                --legend-near: rgba(255, 255, 255, 0.6);
+                --legend-far: rgba(255, 255, 255, 0.06);
+            }
+        }
+
         body {
             margin: 0;
             padding: 0;
+            color: var(--panel-fg);
+        }
+
+        .maplibregl-popup-content {
+            color: #111;
         }
 
         html, body, #map {
@@ -33,7 +72,7 @@
             top: 5px;
             left: 5px;
             z-index: 1000;
-            background: #fff;
+            background: var(--panel-bg);
             border-radius: 3px;
             box-shadow: 0 1px 2px rgba(0, 0, 0, .1);
             padding: 10px;
@@ -44,7 +83,7 @@
             align-items: center;
             justify-content: center;
             text-decoration: none;
-            color: black;
+            color: var(--panel-fg);
             margin-bottom: 16px;
         }
 
@@ -54,7 +93,7 @@
             top: 5px;
             left: 5px;
             z-index: 1000;
-            background: #fff;
+            background: var(--panel-bg);
             border-radius: 3px;
             box-shadow: 0 1px 2px rgba(0, 0, 0, .1);
             padding: 9.5px;
@@ -65,20 +104,41 @@
             align-items: center;
             justify-content: center;
             text-decoration: none;
-            color: black;
+            color: var(--panel-fg);
             font-size: 10pt;
         }
 
+        #mode-toggle {
+            position: absolute;
+            top: 5px;
+            left: 58px;
+            z-index: 1000;
+            background: var(--panel-bg);
+            border-radius: 3px;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, .1);
+            height: 48px;
+            padding: 0 12px;
+            display: flex;
+            align-items: center;
+            text-decoration: none;
+            color: var(--panel-fg);
+            font-size: 10pt;
+        }
+
+        #mode-toggle:hover {
+            background: var(--panel-hover);
+        }
+
         .active {
-            background: #8fff7b;
+            background: var(--active);
         }
 
         #graph-toggle:hover, .level:hover {
-            background: #EEE;
+            background: var(--panel-hover);
         }
 
         .active:hover {
-            background: #bdffb1;
+            background: var(--active-hover);
         }
 
         #profile, #direction, #routing-algorithm, #foot-speed {
@@ -103,6 +163,51 @@
             top: 134px;
         }
 
+        #cells {
+            position: absolute;
+            top: 177px;
+            right: 5px;
+            z-index: 1000;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, .1);
+            background: var(--panel-bg);
+            border-radius: 3px;
+            padding: 6px;
+            font-size: 10pt;
+            display: grid;
+            grid-template-columns: auto 5em;
+            gap: 4px;
+            align-items: center;
+        }
+
+        #cells input {
+            width: 5em;
+        }
+
+        .zone-swatch {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            margin: 0 3px;
+            vertical-align: middle;
+        }
+
+        #cells-legend {
+            grid-column: 1 / span 2;
+            display: none;
+        }
+
+        #cells-legend-bar {
+            height: 10px;
+            border-radius: 2px;
+            background: linear-gradient(to right, var(--legend-near), var(--legend-far));
+        }
+
+        #cells-legend-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9pt;
+        }
+
         #journey-info {
             color: white;
             position: absolute;
@@ -124,6 +229,8 @@
 </head>
 <body>
 <a id="graph-toggle" href="#" onclick="toggleGraph()">G</a>
+<a id="mode-toggle" href="#" onclick="toggleMode()"
+   title="switch between start/destination routing and reach cells"></a>
 <div id="levels"></div>
 <select id="profile" onchange="selectProfile(event)">
     <option value="foot">foot</option>
@@ -143,12 +250,46 @@
 </select>
 <input id="foot-speed" type="number" value="1.2" min="0.1" step="0.1"
        onchange="setSpeed(event)"/>
+<div id="cells" title="right click: add source, double click marker: remove">
+    <label for="cells-max">cells max [min]</label>
+    <input id="cells-max" type="number" value="120" min="1" step="5"
+           onchange="setCellsParam(event)"/>
+    <label for="cells-size">cell size [m]</label>
+    <input id="cells-size" type="number" value="500" min="10" step="50"
+           onchange="setCellsParam(event)"/>
+    <label for="cells-band" title="drive time bands, 0 = no shading">band [min]</label>
+    <input id="cells-band" type="number" value="30" min="0" step="5"
+           onchange="setCellsParam(event)"/>
+    <label for="cells-meet"
+           title="grey: places where the last car arrives at most this much later than at the best place (black dot)">
+        <input id="cells-meet-on" type="checkbox" checked onchange="setCellsParam(event)" style="width: auto"/>
+        <span class="zone-swatch" style="background: var(--meet-fill); border: 1px dashed var(--meet-line)"></span>
+        meet zone + [min]</label>
+    <input id="cells-meet" type="number" value="10" min="0" step="1"
+           onchange="setCellsParam(event)"/>
+    <label for="cells-total"
+           title="white: places where the sum of all drive times is at most this much more than at the best place (white dot)">
+        <input id="cells-total-on" type="checkbox" checked onchange="setCellsParam(event)" style="width: auto"/>
+        <span class="zone-swatch" style="background: var(--total-fill); border: 1px dotted var(--total-line)"></span>
+        total zone + [min]</label>
+    <input id="cells-total" type="number" value="10" min="0" step="1"
+           onchange="setCellsParam(event)"/>
+    <div id="cells-legend" title="drive time from the nearest source">
+        <div id="cells-legend-bar"></div>
+        <div id="cells-legend-labels"><span>0 min</span><span id="cells-legend-max"></span></div>
+    </div>
+</div>
 <div id="journey-info">
     Test
 </div>
 <div id="map"></div>
 <script type="module">
-    import {style} from "./style.js";
+    import {style, isDark, onThemeChange} from "./style.js";
+
+    // Zone colors on the map, keep in sync with the --meet-*/--total-* CSS.
+    const zoneColors = () => isDark()
+        ? {meetFill: '#000', meetOpacity: 0.55, meetLine: '#ddd', totalFill: '#fff', totalLine: '#fff'}
+        : {meetFill: '#555', meetOpacity: 0.45, meetLine: '#222', totalFill: '#fff', totalLine: '#000'};
 
     const start = [8.65749737, 50.10416625]
     const destination = [8.65750757, 50.10417645];
@@ -173,6 +314,256 @@
         }
     }
 
+    // Reach cells: every source gets the area it reaches first by car.
+    const sourceColors = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
+        '#42d4f4', '#f032e6', '#9a6324', '#469990', '#000075'];
+    const sourceColor = (i) => sourceColors[i % sourceColors.length];
+    const sourceColorExpr = ['match', ['get', 'source_idx'],
+        ...sourceColors.flatMap((c, i) => [i, c]), '#888'];
+    const emptyCollection = {type: 'FeatureCollection', features: []};
+    const cellSources = []; // markers, index = source_idx
+    let cellsRequest = 0;
+
+    const cellsParams = () => ({
+        maxMin: parseFloat(document.getElementById('cells-max').value),
+        cellSize: parseFloat(document.getElementById('cells-size').value),
+        bandMin: Math.max(0, parseFloat(document.getElementById('cells-band').value) || 0),
+        meetMargin: document.getElementById('cells-meet-on').checked
+            ? Math.max(0, parseFloat(document.getElementById('cells-meet').value) || 0)
+            : null,
+        totalMargin: document.getElementById('cells-total-on').checked
+            ? Math.max(0, parseFloat(document.getElementById('cells-total').value) || 0)
+            : null
+    });
+
+    // Bands: darker = shorter drive time. Without bands: flat fill.
+    const styleCells = (data, params) => {
+        const hasBands = data.features.some((f) => f.properties.kind === 'band');
+        map.setFilter('cells-fill', ['==', ['get', 'kind'], hasBands ? 'band' : 'outline']);
+        map.setPaintProperty('cells-fill', 'fill-opacity', hasBands
+            ? ['interpolate', ['linear'], ['get', 'from_min'],
+                0, 0.6, Math.max(params.maxMin - params.bandMin, 1), 0.06]
+            : 0.3);
+        document.getElementById('cells-legend').style.display = hasBands ? 'block' : 'none';
+        document.getElementById('cells-legend-max').innerText = `${params.maxMin} min`;
+    };
+
+    const getCells = async (params) => {
+        if (cellSources.length === 0) {
+            return emptyCollection;
+        }
+        const response = await fetch(`${window.origin}/api/cells`, {
+            method: 'POST',
+            mode: 'cors',
+            headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                sources: cellSources.map((m) => ({
+                    lat: m.getLngLat().lat,
+                    lng: m.getLngLat().lng
+                })),
+                profile: 'car',
+                max: Math.round(params.maxMin * 60),
+                cellSize: params.cellSize,
+                bandMinutes: params.bandMin,
+                meetMarginMinutes: params.meetMargin,
+                totalMarginMinutes: params.totalMargin
+            })
+        });
+        const r = await response.json();
+        if (r.error) {
+            console.log(r.error);
+            return emptyCollection;
+        }
+        return r;
+    };
+
+    const updateCells = async () => {
+        const id = ++cellsRequest;
+        const params = cellsParams();
+        const data = await getCells(params);
+        if (id === cellsRequest && map.getSource('cells')) {
+            map.getSource('cells').setData(data);
+            styleCells(data, params);
+        }
+    };
+
+    const createCellSource = (lngLat, i) => {
+        const marker = new maplibregl.Marker({
+            draggable: true,
+            color: sourceColor(i)
+        })
+            .setLngLat(lngLat)
+            .addTo(map)
+            .on('dragend', updateCells);
+        marker.getElement().addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            removeCellSource(marker);
+        });
+        return marker;
+    };
+
+    const addCellSource = (lngLat) => {
+        cellSources.push(createCellSource(lngLat, cellSources.length));
+        updateCells();
+    };
+
+    // Re-create the remaining markers so the colors match the new indices.
+    const removeCellSource = (marker) => {
+        const positions = cellSources.filter((m) => m !== marker)
+            .map((m) => m.getLngLat());
+        cellSources.splice(0).forEach((m) => m.remove());
+        positions.forEach((p, i) => cellSources.push(createCellSource(p, i)));
+        updateCells();
+    };
+
+    window.setCellsParam = () => updateCells();
+
+    const addCells = async () => {
+        const params = cellsParams();
+        const data = await getCells(params);
+        map.addSource('cells', {
+            type: 'geojson',
+            data
+        });
+        map.addLayer({
+            'id': 'cells-fill',
+            'type': 'fill',
+            'source': 'cells',
+            'paint': {
+                'fill-color': sourceColorExpr,
+                'fill-opacity': 0.3
+            }
+        });
+        map.addLayer({
+            'id': 'cells-outline',
+            'type': 'line',
+            'source': 'cells',
+            'layout': {
+                'line-join': 'round'
+            },
+            'filter': ['==', ['get', 'kind'], 'outline'],
+            'paint': {
+                'line-color': sourceColorExpr,
+                'line-width': 2,
+                'line-opacity': 0.9
+            }
+        });
+        map.addLayer({
+            'id': 'meet-zone-fill',
+            'type': 'fill',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'meet_zone'],
+            'paint': {
+                'fill-color': zoneColors().meetFill,
+                'fill-opacity': zoneColors().meetOpacity
+            }
+        });
+        map.addLayer({
+            'id': 'meet-zone-line',
+            'type': 'line',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'meet_zone'],
+            'layout': {
+                'line-join': 'round'
+            },
+            'paint': {
+                'line-color': zoneColors().meetLine,
+                'line-width': 1.5,
+                'line-dasharray': [2, 1]
+            }
+        });
+        map.addLayer({
+            'id': 'total-zone-fill',
+            'type': 'fill',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'total_zone'],
+            'paint': {
+                'fill-color': zoneColors().totalFill,
+                'fill-opacity': 0.55
+            }
+        });
+        map.addLayer({
+            'id': 'total-zone-line',
+            'type': 'line',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'total_zone'],
+            'layout': {
+                'line-join': 'round',
+                'line-cap': 'round'
+            },
+            'paint': {
+                'line-color': zoneColors().totalLine,
+                'line-width': 2,
+                'line-dasharray': [0.1, 2]
+            }
+        });
+        map.addLayer({
+            'id': 'meet-point',
+            'type': 'circle',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'meet_point'],
+            'paint': {
+                'circle-color': '#000',
+                'circle-radius': 7,
+                'circle-stroke-color': '#fff',
+                'circle-stroke-width': 2
+            }
+        });
+        map.addLayer({
+            'id': 'total-point',
+            'type': 'circle',
+            'source': 'cells',
+            'filter': ['==', ['get', 'kind'], 'total_point'],
+            'paint': {
+                'circle-color': '#fff',
+                'circle-radius': 7,
+                'circle-stroke-color': '#000',
+                'circle-stroke-width': 2
+            }
+        });
+        styleCells(data, params);
+    };
+
+    // Mode: 'route' (start/destination query) or 'cells' (reach cells).
+    let mode = 'route';
+    const routeControls = ['profile', 'direction', 'routing-algorithm',
+        'foot-speed', 'journey-info'].map((id) => document.getElementById(id));
+    const cellsControls = [document.getElementById('cells')];
+    const routeLayers = ['path-outline', 'path'];
+    const cellsLayers = ['cells-fill', 'cells-outline', 'meet-zone-fill',
+        'meet-zone-line', 'total-zone-fill', 'total-zone-line', 'meet-point',
+        'total-point'];
+
+    const applyMode = () => {
+        const isRoute = mode === 'route';
+        document.getElementById('mode-toggle').innerText =
+            isRoute ? 'mode: route' : 'mode: cells';
+        routeControls.forEach((el) => el.style.display = isRoute ? '' : 'none');
+        cellsControls.forEach((el) => el.style.display = isRoute ? 'none' : '');
+        [startMarker, destinationMarker].forEach(
+            (m) => m.getElement().style.display = isRoute ? '' : 'none');
+        cellSources.forEach(
+            (m) => m.getElement().style.display = isRoute ? 'none' : '');
+        const setVisible = (layers, visible) => layers.forEach((l) => {
+            if (map.getLayer(l)) {
+                map.setLayoutProperty(l, 'visibility', visible ? 'visible' : 'none');
+            }
+        });
+        setVisible(routeLayers, isRoute);
+        setVisible(cellsLayers, !isRoute);
+    };
+
+    window.toggleMode = () => {
+        mode = mode === 'route' ? 'cells' : 'route';
+        if (popup != null) {
+            popup.remove();
+        }
+        applyMode();
+    };
+
     const map = new maplibregl.Map({
         container: 'map',
         center: start,
@@ -181,12 +572,7 @@
             sources: {},
             layers: [],
         },
-        zoom: 18,
-        transformRequest: (url, resourceType) => {
-            if (url.startsWith('/')) {
-                return {url: `https://europe.motis-project.de/tiles${url}`}
-            }
-        }
+        zoom: 18
     });
 
     const toTable = (properties) => {
@@ -327,6 +713,7 @@
             currentLevel = 0;
             graph = false;
             style(map, 0);
+            await addCells();
             await addRouting();
             await updateGraph();
         }
@@ -340,6 +727,7 @@
                 currentLevel = l;
                 graph = false;
                 style(map, l);
+                await addCells();
                 await addRouting();
                 await updateGraph();
             };
@@ -390,6 +778,7 @@
                 'line-opacity': 0.8
             }
         });
+        applyMode();
     }
 
     const updateLevels = async () => {
@@ -400,9 +789,19 @@
         }
     }
 
+    // Light/dark map style follows the system theme.
+    onThemeChange(async () => {
+        style(map, currentLevel);
+        await addCells();
+        await addRouting();
+        graph = false;
+        await updateGraph();
+    });
+
     map.on('load', async () => {
         style(map, 0);
         await updateLevels();
+        await addCells();
         await addRouting();
     });
 
@@ -594,6 +993,39 @@
         });
     });
 
+    // Meeting points: drive time of each source.
+    const showMeetPopup = (e, title) => {
+        const props = e.features[0].properties;
+        // GeoJSON source properties arrive JSON-encoded for arrays
+        const perSource = typeof props.per_source_min === 'string'
+            ? JSON.parse(props.per_source_min) : props.per_source_min;
+        const div = document.createElement('div');
+        const head = document.createElement('b');
+        head.innerText = title;
+        div.appendChild(head);
+        const summary = document.createElement('div');
+        summary.innerText = `last arrival: ${Math.round(props.latest_min)} min, ` +
+            `total: ${Math.round(props.total_min)} min`;
+        div.appendChild(summary);
+        perSource.forEach((m, i) => {
+            const row = document.createElement('div');
+            const dot = document.createElement('span');
+            dot.style.cssText = `display:inline-block;width:10px;height:10px;` +
+                `border-radius:5px;margin-right:6px;background:${sourceColor(i)}`;
+            row.appendChild(dot);
+            row.appendChild(document.createTextNode(`${Math.round(m)} min`));
+            div.appendChild(row);
+        });
+        new maplibregl.Popup().setLngLat(e.lngLat).setDOMContent(div).addTo(map);
+        e.originalEvent.stopPropagation();
+    };
+    [['meet-point', 'earliest last arrival'],
+        ['total-point', 'smallest total drive time']].forEach(([layer, title]) => {
+        map.on('click', layer, (e) => showMeetPopup(e, title));
+        map.on('mouseenter', layer, () => map.getCanvas().style.cursor = 'pointer');
+        map.on('mouseleave', layer, () => map.getCanvas().style.cursor = '');
+    });
+
     const startMarker = new maplibregl.Marker({
         draggable: true,
         color: 'green'
@@ -631,6 +1063,19 @@
         const x = e.lngLat;
 
         const actionsDiv = document.createElement('div');
+        if (mode === 'cells') {
+            addCellsActions(actionsDiv, x);
+        } else {
+            addRouteActions(actionsDiv, x);
+        }
+
+        popup
+            .setLngLat(x)
+            .setDOMContent(actionsDiv)
+            .addTo(map);
+    });
+
+    const addRouteActions = (actionsDiv, x) => {
         const setStart = document.createElement('a');
         setStart.classList.add('context');
         setStart.href = '#';
@@ -656,12 +1101,34 @@
             updateRoute();
         };
         actionsDiv.appendChild(setDest);
+    };
 
-        popup
-            .setLngLat(x)
-            .setDOMContent(actionsDiv)
-            .addTo(map);
-    });
+    const addCellsActions = (actionsDiv, x) => {
+        const addSource = document.createElement('a');
+        addSource.classList.add('context');
+        addSource.href = '#';
+        addSource.innerText = "add source";
+        addSource.onclick = (e) => {
+            popup.remove();
+            addCellSource(x);
+        };
+        actionsDiv.appendChild(addSource);
+
+        if (cellSources.length !== 0) {
+            const clearSources = document.createElement('a');
+            clearSources.classList.add('context');
+            clearSources.href = '#';
+            clearSources.innerText = "clear sources";
+            clearSources.onclick = (e) => {
+                popup.remove();
+                cellSources.splice(0).forEach((m) => m.remove());
+                updateCells();
+            };
+            actionsDiv.appendChild(clearSources);
+        }
+    };
+
+    applyMode();
 </script>
 </body>
 </html>

@@ -28,6 +28,7 @@
 #include "osr/routing/profiles/car_parking.h"
 #include "osr/routing/profiles/car_sharing.h"
 #include "osr/routing/profiles/foot.h"
+#include "osr/routing/reach_cells.h"
 #include "osr/routing/route.h"
 
 using namespace net;
@@ -163,6 +164,108 @@ struct http_server::impl {
     cb(json_response(req, to_featurecollection(w_, p)));
   }
 
+  void handle_cells(web_server::http_req_t const& req,
+                    web_server::http_res_cb_t const& cb) {
+    auto const q = boost::json::parse(req.body()).as_object();
+    auto const profile_it = q.find("profile");
+    auto const profile =
+        profile_it == q.end() || !profile_it->value().is_string()
+            ? search_profile::kCar
+            : to_profile(profile_it->value().as_string());
+    auto const sources =
+        utl::to_vec(q.at("sources").as_array(),
+                    [](json::value const& v) { return parse_location(v); });
+
+    auto p = reach_cells_params{};
+    if (auto const it = q.find("max"); it != q.end()) {
+      p.max_ = static_cast<cost_t>(it->value().to_number<std::int64_t>());
+    }
+    if (auto const it = q.find("cellSize"); it != q.end()) {
+      p.cell_size_m_ = it->value().to_number<double>();
+    }
+    if (auto const it = q.find("fillSteps"); it != q.end()) {
+      p.fill_steps_ = it->value().to_number<unsigned>();
+    }
+    auto const get_minutes = [&](char const* key) {
+      auto const it = q.find(key);
+      return it == q.end() || !it->value().is_number()
+                 ? std::nullopt
+                 : std::optional{duration_t{static_cast<duration_t::rep>(
+                       std::clamp(it->value().to_number<double>() * 60.0, 0.0,
+                                  18.0 * 3600.0))}};
+    };
+    p.meet_margin_ = get_minutes("meetMarginMinutes");
+    p.total_margin_ = get_minutes("totalMarginMinutes");
+    if (auto const it = q.find("bandMinutes"); it != q.end()) {
+      p.band_size_ = duration_t{static_cast<duration_t::rep>(std::clamp(
+          it->value().to_number<double>() * 60.0, 0.0, 18.0 * 3600.0))};
+    }
+    utl::verify(p.cell_size_m_ >= 10.0, "cellSize must be >= 10m");
+
+    auto const cells = compute_reach_cells(get_parameters(profile), w_, l_,
+                                           profile, sources, p, 100);
+
+    auto features = json::array{};
+    auto const add = [&](reach_polygon const& polygon, json::object props) {
+      auto rings = json::array{};
+      for (auto const& ring : polygon) {
+        // 1e-5 degrees ~ 1m: plenty for cells, halves the response size
+        auto coords = json::array{};
+        coords.reserve(ring.size());
+        for (auto const& x : ring) {
+          coords.emplace_back(json::array{std::round(x.lng() * 1e5) / 1e5,
+                                          std::round(x.lat() * 1e5) / 1e5});
+        }
+        rings.emplace_back(std::move(coords));
+      }
+      features.emplace_back(json::object{
+          {"type", "Feature"},
+          {"properties", std::move(props)},
+          {"geometry",
+           {{"type", "Polygon"}, {"coordinates", std::move(rings)}}}});
+    };
+    // Bands first, so the outlines are drawn on top within one layer order.
+    for (auto const& b : cells.bands_) {
+      add(b.polygon_, {{"kind", "band"},
+                       {"source_idx", b.source_},
+                       {"band", b.band_},
+                       {"from_min", b.band_ * p.band_size_.count() / 60.0}});
+    }
+    for (auto const [source, polygons] : utl::enumerate(cells.sources_)) {
+      for (auto const& polygon : polygons) {
+        add(polygon, {{"kind", "outline"}, {"source_idx", source}});
+      }
+    }
+    auto const add_meet = [&](std::optional<reach_cells::meet> const& m,
+                              char const* zone_kind, char const* point_kind) {
+      if (!m.has_value()) {
+        return;
+      }
+      for (auto const& polygon : m->zone_) {
+        add(polygon, {{"kind", zone_kind}});
+      }
+      auto per_source = json::array{};
+      for (auto const d : m->per_source_) {
+        per_source.emplace_back(d.count() / 60.0);
+      }
+      features.emplace_back(json::object{
+          {"type", "Feature"},
+          {"properties",
+           {{"kind", point_kind},
+            {"latest_min", m->latest_ / 60.0},
+            {"total_min", m->total_ / 60.0},
+            {"per_source_min", std::move(per_source)}}},
+          {"geometry",
+           {{"type", "Point"},
+            {"coordinates", json::array{m->pos_.lng(), m->pos_.lat()}}}}});
+    };
+    add_meet(cells.meet_, "meet_zone", "meet_point");
+    add_meet(cells.total_meet_, "total_zone", "total_point");
+    cb(json_response(
+        req, json::serialize(json::object{{"type", "FeatureCollection"},
+                                          {"features", std::move(features)}})));
+  }
+
   void handle_levels(web_server::http_req_t const& req,
                      web_server::http_res_cb_t const& cb) {
     auto const query = boost::json::parse(req.body()).as_object();
@@ -251,6 +354,13 @@ struct http_server::impl {
               [this](web_server::http_req_t const& req1,
                      web_server::http_res_cb_t const& cb1) {
                 handle_route(req1, cb1);
+              },
+              req, cb);
+        } else if (target.starts_with("/api/cells")) {
+          return run_parallel(
+              [this](web_server::http_req_t const& req1,
+                     web_server::http_res_cb_t const& cb1) {
+                handle_cells(req1, cb1);
               },
               req, cb);
         } else if (target.starts_with("/api/levels")) {
