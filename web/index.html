@@ -179,6 +179,10 @@
             align-items: center;
         }
 
+        #cells .unavailable {
+            opacity: 0.4;
+        }
+
         #cells input {
             width: 5em;
         }
@@ -267,7 +271,7 @@
         meet zone + [min]</label>
     <input id="cells-meet" type="number" value="10" min="0" step="1"
            onchange="setCellsParam(event)"/>
-    <label for="cells-total"
+    <label for="cells-total" id="cells-total-label"
            title="white: places where the sum of all drive times is at most this much more than at the best place (white dot)">
         <input id="cells-total-on" type="checkbox" checked onchange="setCellsParam(event)" style="width: auto"/>
         <span class="zone-swatch" style="background: var(--total-fill); border: 1px dotted var(--total-line)"></span>
@@ -331,7 +335,10 @@
         meetMargin: document.getElementById('cells-meet-on').checked
             ? Math.max(0, parseFloat(document.getElementById('cells-meet').value) || 0)
             : null,
-        totalMargin: document.getElementById('cells-total-on').checked
+        // With two sources, every place on the fastest route between them has
+        // the same total: the zone would just be that route.
+        totalMargin: cellSources.length >= 3 &&
+        document.getElementById('cells-total-on').checked
             ? Math.max(0, parseFloat(document.getElementById('cells-total').value) || 0)
             : null
     });
@@ -380,7 +387,21 @@
         return r;
     };
 
+    // The total zone needs at least three sources.
+    const kTotalTitle = document.getElementById('cells-total-label').title;
+    const updateTotalAvailability = () => {
+        const available = cellSources.length >= 3;
+        const label = document.getElementById('cells-total-label');
+        const input = document.getElementById('cells-total');
+        [label, input].forEach((el) => el.classList.toggle('unavailable', !available));
+        document.getElementById('cells-total-on').disabled = !available;
+        input.disabled = !available;
+        label.title = available ? kTotalTitle
+            : 'needs at least 3 sources: with 2, every place on the fastest route between them has the same total';
+    };
+
     const updateCells = async () => {
+        updateTotalAvailability();
         const id = ++cellsRequest;
         const params = cellsParams();
         const data = await getCells(params);
@@ -1128,6 +1149,7 @@
         }
     };
 
+    updateTotalAvailability();
     applyMode();
 </script>
 </body>
