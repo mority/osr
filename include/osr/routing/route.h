@@ -42,6 +42,8 @@ struct rental_duration_info {
   duration_t ride_end_;
 };
 
+// With `sharing_data::classes_`, results and destination indices are per class
+// and destination: `class * to.size() + destination`.
 struct one_to_many_state {
   virtual ~one_to_many_state() = default;
   virtual std::vector<std::optional<path>> const& results() const = 0;

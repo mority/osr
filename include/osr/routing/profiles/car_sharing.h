@@ -3,6 +3,7 @@
 #include <cassert>
 
 #include <array>
+#include <bit>
 #include <functional>
 #include <optional>
 #include <string_view>
@@ -103,6 +104,15 @@ struct car_sharing {
     std::unreachable();
   }
 
+  // Class of the walk that follows the vehicle in search direction, see
+  // `sharing_data::classes_`. Every other state is in class 0.
+  using class_t = std::uint8_t;
+
+  static constexpr node_type classed_type(direction const search_dir) {
+    return search_dir == direction::kForward ? node_type::kTrailingFoot
+                                             : node_type::kInitialFoot;
+  }
+
   struct parameters {
     using profile_t = car_sharing<Tracking>;
     car::parameters car_{};
@@ -115,19 +125,29 @@ struct car_sharing {
 
     node_idx_t n_{node_idx_t::invalid()};
     level_t lvl_{};
+    class_t cls_{0U};
   };
 
-  using hash = footp::hash;
+  struct hash {
+    using is_avalanching = void;
+    auto operator()(auto const n) const noexcept -> std::uint64_t {
+      using namespace ankerl::unordered_dense::detail;
+      auto const packed = (static_cast<std::uint64_t>(n.cls_) << 40U) |
+                          (static_cast<std::uint64_t>(to_idx(n.lvl_)) << 32U) |
+                          static_cast<std::uint64_t>(to_idx(n.n_));
+      return wyhash::hash(packed);
+    }
+  };
 
   struct node {
     friend bool operator==(node const a, node const b) {
       return a.n_ == b.n_ && a.type_ == b.type_ && a.dir_ == b.dir_ &&
-             a.way_ == b.way_ && a.lvl_ == b.lvl_;
+             a.way_ == b.way_ && a.lvl_ == b.lvl_ && a.cls_ == b.cls_;
     }
 
     friend constexpr bool operator<(node const& a, node const& b) noexcept {
-      return std::tie(a.n_, a.type_, a.lvl_, a.way_, a.dir_) <
-             std::tie(b.n_, b.type_, b.lvl_, b.way_, b.dir_);
+      return std::tie(a.n_, a.type_, a.lvl_, a.way_, a.dir_, a.cls_) <
+             std::tie(b.n_, b.type_, b.lvl_, b.way_, b.dir_, b.cls_);
     }
 
     boost::json::object geojson_properties(ways const& w) const {
@@ -149,12 +169,13 @@ struct car_sharing {
                  << ", level=" << lvl_ << ", dir=" << dir_
                  << ", way=" << w.way_osm_idx_[w.r_->node_ways_[n_][way_]]
                  << " (" << static_cast<unsigned>(way_) << ")"
-                 << ", type=" << node_type_to_str(type_) << ")";
+                 << ", type=" << node_type_to_str(type_)
+                 << ", class=" << static_cast<unsigned>(cls_) << ")";
     }
 
     static constexpr node invalid() noexcept { return {}; }
     constexpr node_idx_t get_node() const noexcept { return n_; }
-    constexpr key get_key() const noexcept { return {n_, lvl_}; }
+    constexpr key get_key() const noexcept { return {n_, lvl_, cls_}; }
 
     constexpr std::optional<direction> get_direction() const noexcept {
       return dir_;
@@ -190,6 +211,7 @@ struct car_sharing {
     level_t lvl_{};
     direction dir_{direction::kForward};
     way_pos_t way_{};
+    class_t cls_{0U};
   };
 
   struct label {
@@ -199,11 +221,16 @@ struct car_sharing {
           type_{n.type_},
           lvl_{n.lvl_},
           dir_{n.dir_},
-          way_{n.way_} {}
+          way_{n.way_},
+          cls_{n.cls_} {}
 
     constexpr node get_node() const noexcept {
-      return {
-          .n_ = n_, .type_ = type_, .lvl_ = lvl_, .dir_ = dir_, .way_ = way_};
+      return {.n_ = n_,
+              .type_ = type_,
+              .lvl_ = lvl_,
+              .dir_ = dir_,
+              .way_ = way_,
+              .cls_ = cls_};
     }
 
     constexpr cost_t cost() const noexcept { return cost_; }
@@ -222,6 +249,7 @@ struct car_sharing {
     level_t lvl_;
     direction dir_;
     way_pos_t way_;
+    class_t cls_;
     OSR_NO_UNIQUE_ADDRESS Tracking tracking_{};
   };
 
@@ -252,14 +280,18 @@ struct car_sharing {
 
     std::optional<node> pred(node const n) const noexcept {
       auto const s = s_[get_index(n)];
+      auto const pred_type = static_cast<node_type>(s.pred_type_);
+      // Only the walk after the vehicle (search direction) has classes: a
+      // predecessor of the same type is in the same class, the vehicle in 0.
       return s.pred_ == node_idx_t::invalid()
                  ? std::nullopt
-                 : std::optional{
-                       node{.n_ = s.pred_,
-                            .type_ = static_cast<node_type>(s.pred_type_),
-                            .lvl_ = s.pred_lvl_,
-                            .dir_ = to_dir(s.pred_dir_),
-                            .way_ = s.pred_way_}};
+                 : std::optional{node{
+                       .n_ = s.pred_,
+                       .type_ = pred_type,
+                       .lvl_ = s.pred_lvl_,
+                       .dir_ = to_dir(s.pred_dir_),
+                       .way_ = s.pred_way_,
+                       .cls_ = pred_type == n.type_ ? n.cls_ : class_t{0U}}};
     }
 
     cost_t cost(node const n) const noexcept { return s_[get_index(n)].cost_; }
@@ -321,8 +353,21 @@ struct car_sharing {
     return {.n_ = n.n_, .way_ = n.way_, .dir_ = n.dir_};
   }
 
-  static node to_node(footp::node const n, node_type const type) {
-    return {.n_ = n.n_, .type_ = type, .lvl_ = n.lvl_};
+  static node to_node(footp::node const n,
+                      node_type const type,
+                      class_t const cls = 0U) {
+    return {.n_ = n.n_, .type_ = type, .lvl_ = n.lvl_, .cls_ = cls};
+  }
+
+  // The state `n` in class `cls` if it is part of the walk that has classes in
+  // search direction `search_dir`, `n` itself otherwise.
+  static constexpr node with_class(node n,
+                                   class_t const cls,
+                                   direction const search_dir) {
+    if (n.type_ == classed_type(search_dir)) {
+      n.cls_ = cls;
+    }
+    return n;
   }
 
   static node to_node(car::node const n, level_t const lvl) {
@@ -362,12 +407,38 @@ struct car_sharing {
                        Fn&& fn) {
     assert(sharing != nullptr);
 
+    // Leaving the vehicle enters the walk that follows it in search direction
+    // once per class of the node (one class without `classes_`).
+    auto const for_each_class = [&](node_idx_t const at, auto&& f) {
+      if (sharing->classes_ == nullptr) {
+        f(class_t{0U});
+        return;
+      }
+      if (auto const it = sharing->classes_->find(at);
+          it != end(*sharing->classes_)) {
+        for (auto mask = it->second; mask != 0U; mask &= mask - 1U) {
+          f(static_cast<class_t>(std::countr_zero(mask)));
+        }
+      }
+    };
+
     auto const& handle_additional_edge = [&](additional_edge const& ae,
                                              node_type const nt,
                                              cost_and_duration const edge) {
       auto const emit = [&](node const target) {
         fn(target, edge.cost_, edge.duration_, ae.distance_,
            way_idx_t::invalid(), 0, 1, elevation_storage::elevation{}, false);
+      };
+      // walking on stays in its class, leaving the vehicle enters the classes
+      // of the station
+      auto const for_each_target_class = [&](auto&& f) {
+        if (nt == node_type::kRental) {
+          f(class_t{0U});
+        } else if (n.is_rental_node()) {
+          for_each_class(n.n_, f);
+        } else {
+          f(n.cls_);
+        }
       };
       if (nt == node_type::kRental && !sharing->is_additional_node(ae.to_)) {
         // Picking the vehicle up at a station leaves it without an incoming
@@ -388,14 +459,19 @@ struct car_sharing {
         // actually has. A `kNoLevel` walking state would match any way (see
         // `footp::get_target_level`) and the backward search would never
         // produce it.
-        footp::resolve_all(w, ae.to_, [&](footp::node const foot_state) {
-          emit(to_node(foot_state, nt));
+        for_each_target_class([&](class_t const cls) {
+          footp::resolve_all(w, ae.to_, [&](footp::node const foot_state) {
+            emit(to_node(foot_state, nt, cls));
+          });
         });
         return;
       }
-      emit(node{.n_ = ae.to_,
-                .type_ = nt,
-                .lvl_ = nt == node_type::kRental ? kNoLevel : n.lvl_});
+      for_each_target_class([&](class_t const cls) {
+        emit(node{.n_ = ae.to_,
+                  .type_ = nt,
+                  .lvl_ = nt == node_type::kRental ? kNoLevel : n.lvl_,
+                  .cls_ = cls});
+      });
     };
 
     auto const& continue_on_foot = [&](node_type const nt,
@@ -408,8 +484,8 @@ struct car_sharing {
               way_idx_t const way, std::uint16_t const from,
               std::uint16_t const to,
               elevation_storage::elevation const elevation, bool) {
-            fn(to_node(neighbor, nt), cost, duration, dist, way, from, to,
-               elevation, false);
+            fn(to_node(neighbor, nt, n.cls_), cost, duration, dist, way, from,
+               to, elevation, false);
           });
       // The connector's other end resolves walking states, so only offer it
       // from a level `footp::resolve_all` produces here - otherwise the two
@@ -458,8 +534,10 @@ struct car_sharing {
           emit(to_node(rental, kNoLevel));
         });
       } else {
-        footp::resolve_all(w, n.n_, [&](footp::node const foot_state) {
-          emit(to_node(foot_state, to_type));
+        for_each_class(n.n_, [&](class_t const cls) {
+          footp::resolve_all(w, n.n_, [&](footp::node const foot_state) {
+            emit(to_node(foot_state, to_type, cls));
+          });
         });
       }
     };
@@ -732,7 +810,8 @@ struct car_sharing {
             .type_ = n.type_,
             .lvl_ = n.lvl_,
             .dir_ = opposite(n.dir_),
-            .way_ = n.way_};
+            .way_ = n.way_,
+            .cls_ = n.cls_};
   }
 };
 

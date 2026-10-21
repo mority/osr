@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <vector>
 
 #include "geo/latlng.h"
@@ -11,6 +12,10 @@
 #include "osr/ways.h"
 
 namespace osr {
+
+// Bit i set: class i (see sharing_data::classes_).
+using sharing_class_mask_t = std::uint64_t;
+constexpr auto const kMaxSharingClasses = 64U;
 
 inline void verify_additional_edge_count(
     hash_map<node_idx_t, std::vector<additional_edge>> const& edges,
@@ -59,6 +64,17 @@ struct sharing_data {
   node_idx_t::value_t additional_node_offset_{};
   std::vector<geo::latlng> const& additional_node_coordinates_;
   hash_map<node_idx_t, std::vector<additional_edge>> const& additional_edges_;
+
+  // Optional, car_sharing only: splits the walk that follows the vehicle in
+  // search direction (after the drop-off forward, before the pickup backward)
+  // into `n_classes_` classes. A node maps to the classes in which the vehicle
+  // may be left there (forward) or taken there (backward); with `classes_`
+  // set, nodes without an entry allow no such switch. route_one_to_many()
+  // then reports one result per class and destination, at index
+  // `class * to.size() + destination`: one search instead of one per class
+  // whose searches differ only in that end.
+  hash_map<node_idx_t, sharing_class_mask_t> const* classes_{};
+  std::uint8_t n_classes_{1U};
 };
 
 inline bool is_allowed(bitvec<node_idx_t> const* b, node_idx_t const n) {

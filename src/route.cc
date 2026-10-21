@@ -412,6 +412,24 @@ struct destination_candidate {
   cost_and_duration total_;
 };
 
+template <typename P>
+concept classed_profile = requires(typename P::node const n) {
+  P::with_class(n, std::uint8_t{}, direction::kForward);
+};
+
+// Number of classes the walk after the vehicle is split into (see
+// sharing_data::classes_), 1 if the profile or the search has none.
+template <Profile P>
+std::size_t n_classes(sharing_data const* sharing) {
+  if constexpr (classed_profile<P>) {
+    return sharing != nullptr && sharing->classes_ != nullptr
+               ? sharing->n_classes_
+               : 1U;
+  } else {
+    return 1U;
+  }
+}
+
 template <Profile P, typename Search>
 std::optional<destination_candidate<P>> best_candidate(
     typename P::parameters const& params,
@@ -420,12 +438,16 @@ std::optional<destination_candidate<P>> best_candidate(
     match_view_t const& matches,
     cost_t const max,
     direction const dir,
-    std::optional<routing_time_t> const start_time) {
+    std::optional<routing_time_t> const start_time,
+    std::uint8_t const cls = 0U) {
   auto best = std::optional<destination_candidate<P>>{};
   auto const end = route_end_of(opposite(dir));
   for_each_endpoint_candidate(matches, [&](endpoint_candidate const& endpoint) {
     auto const& candidate_node = endpoint.node_;
-    auto const consider = [&](auto const node) {
+    auto const consider = [&](typename P::node node) {
+      if constexpr (classed_profile<P>) {
+        node = P::with_class(node, cls, dir);
+      }
       auto const target_cost = search.get_cost(node);
       if (target_cost == kInfeasible) {
         return;
@@ -866,10 +888,10 @@ struct one_to_many_state_impl final : public one_to_many_state {
     }
     auto const& c = *candidates_[k];
     auto const& sp = d_.params_;
-    return osr::reconstruct<P>(sp.profile_, w, l, sp.blocked_, sharing,
-                               sp.elevations_, d_, sp.start_loc_, to_[k],
-                               starts_, c.endpoint_, c.connection_, c.node_,
-                               c.total_, sp.dir_, sp.start_time_);
+    return osr::reconstruct<P>(
+        sp.profile_, w, l, sp.blocked_, sharing, sp.elevations_, d_,
+        sp.start_loc_, to_[k % to_.size()], starts_, c.endpoint_, c.connection_,
+        c.node_, c.total_, sp.dir_, sp.start_time_);
   }
 
   std::optional<rental_duration_info> rental_durations(
@@ -952,7 +974,9 @@ std::vector<std::optional<path>> route(
     elevation_storage const* elevations,
     std::function<bool(path const&)> const& do_reconstruct,
     one_to_many_state_impl<P>* const state = nullptr) {
-  auto result = std::vector<std::optional<path>>(to_match.size());
+  // One result per class and destination: index class * n_to + destination.
+  auto const n_to = to_match.size();
+  auto result = std::vector<std::optional<path>>(n_classes<P>(sharing) * n_to);
 
   if (from_match.empty() || to_match.empty()) {
     return result;
@@ -989,24 +1013,28 @@ std::vector<std::optional<path>> route(
         d.add_start(std::forward<decltype(label)>(label), duration);
       });
   d.run();
-  auto const find_candidate = [&](std::size_t const i) {
+  auto const find_candidate = [&](std::size_t const k) {
+    auto const i = k % n_to;
     return best_candidate<P>(
         params, w, d,
         to_match[match_idx_t{static_cast<match_idx_t::value_t>(i)}],
-        destination_limits[i], dir, start_time);
+        destination_limits[i], dir, start_time,
+        static_cast<std::uint8_t>(k / n_to));
   };
   auto local_candidates =
       std::vector<std::optional<destination_candidate<P>>>{};
   auto& candidates = state == nullptr ? local_candidates : state->candidates_;
   candidates.resize(result.size());
-  auto stretches = std::vector<std::optional<path>>(result.size());
+  auto stretches = std::vector<std::optional<path>>(n_to);
   auto settle_cost = cost_t{0U};
-  for (auto i = std::size_t{0U}; i != result.size(); ++i) {
-    candidates[i] = find_candidate(i);
-    if (candidates[i].has_value() &&
-        candidates[i]->total_.duration_ <= max_duration) {
-      settle_cost = std::max(settle_cost, candidates[i]->total_.cost_);
+  for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+    candidates[k] = find_candidate(k);
+    if (candidates[k].has_value() &&
+        candidates[k]->total_.duration_ <= max_duration) {
+      settle_cost = std::max(settle_cost, candidates[k]->total_.cost_);
     }
+  }
+  for (auto i = std::size_t{0U}; i != n_to; ++i) {
     if (try_direct(from, to[i], dir).has_value()) {
       continue;
     }
@@ -1021,22 +1049,23 @@ std::vector<std::optional<path>> route(
   // Finalize all candidates (and settle up to the direct pieces) before
   // reconstructing paths from the shared search.
   if (d.settle_up_to(settle_cost)) {
-    for (auto i = std::size_t{0U}; i != result.size(); ++i) {
-      candidates[i] = find_candidate(i);
+    for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+      candidates[k] = find_candidate(k);
     }
   }
-  for (auto i = std::size_t{0U}; i != result.size(); ++i) {
+  for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+    auto const i = k % n_to;
     if (auto direct = try_direct(from, to[i], dir); direct.has_value()) {
-      result[i] = within_duration_limit(std::move(direct), max_duration);
-      candidates[i].reset();
+      result[k] = within_duration_limit(std::move(direct), max_duration);
+      candidates[k].reset();
       continue;
     }
-    auto const& candidate = candidates[i];
-    if (auto& stretch = stretches[i];
+    auto const& candidate = candidates[k];
+    if (auto const& stretch = stretches[i];
         stretch.has_value() &&
         (!candidate.has_value() || total_of(*stretch) < candidate->total_)) {
-      result[i] = within_duration_limit(std::move(stretch), max_duration);
-      candidates[i].reset();
+      result[k] = within_duration_limit(stretch, max_duration);
+      candidates[k].reset();
       continue;
     }
     if (!candidate.has_value() || candidate->total_.duration_ > max_duration) {
@@ -1051,7 +1080,7 @@ std::vector<std::optional<path>> route(
                          candidate->connection_, candidate->node_,
                          candidate->total_, dir, start_time);
     }
-    result[i] = std::move(p);
+    result[k] = std::move(p);
   }
   return result;
 }
