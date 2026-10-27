@@ -157,8 +157,6 @@ constexpr bool osm_id_less(OsmIdx const lhs, OsmIdx const rhs) {
 using way_idx_t = cista::strong<std::uint32_t, struct way_idx_>;
 using node_idx_t = cista::strong<std::uint32_t, struct node_idx_>;
 
-using component_idx_t = cista::strong<std::uint32_t, struct component_idx_>;
-
 using platform_idx_t = cista::strong<std::uint32_t, struct platform_idx_>;
 
 using multi_level_elevator_idx_t =
@@ -212,6 +210,8 @@ constexpr duration_t duration_from_cost(T const c) {
 struct cost_and_duration {
   cost_t cost_{0U};
   duration_t duration_{0U};
+
+  constexpr auto operator<=>(cost_and_duration const&) const noexcept = default;
 
   constexpr bool feasible() const noexcept { return cost_ != kInfeasible; }
 };
