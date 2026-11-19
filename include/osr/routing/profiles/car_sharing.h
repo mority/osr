@@ -115,9 +115,20 @@ struct car_sharing {
 
     node_idx_t n_{node_idx_t::invalid()};
     level_t lvl_{};
+    color_t color_{kNoColor};
   };
 
-  using hash = footp::hash;
+  // Like footp::hash, plus the color (see `cost_map`).
+  struct hash {
+    using is_avalanching = void;
+    auto operator()(auto const n) const noexcept -> std::uint64_t {
+      using namespace ankerl::unordered_dense::detail;
+      auto const packed = (static_cast<std::uint64_t>(n.color_) << 40U) |
+                          (static_cast<std::uint64_t>(to_idx(n.lvl_)) << 32U) |
+                          static_cast<std::uint64_t>(to_idx(n.n_));
+      return wyhash::hash(packed);
+    }
+  };
 
   struct node {
     friend bool operator==(node const a, node const b) {
@@ -138,23 +149,50 @@ struct car_sharing {
       if (is_rental_node()) {
         properties.emplace("direction", to_str(dir_));
       }
+      if (color() != kNoColor) {
+        properties.emplace("color", color());
+      }
       return properties;
     }
 
     std::ostream& print(std::ostream& out, ways const& w) const {
-      return out << "(node="
-                 << (n_ >= w.n_nodes() ? osm_node_idx_t{to_idx(n_)}
-                                       : w.node_to_osm_[n_])
-                 << (n_ >= w.n_nodes() ? "*" : "") << " (" << n_ << ")"
-                 << ", level=" << lvl_ << ", dir=" << dir_
-                 << ", way=" << w.way_osm_idx_[w.r_->node_ways_[n_][way_]]
-                 << " (" << static_cast<unsigned>(way_) << ")"
-                 << ", type=" << node_type_to_str(type_) << ")";
+      out << "(node="
+          << (n_ >= w.n_nodes() ? osm_node_idx_t{to_idx(n_)}
+                                : w.node_to_osm_[n_])
+          << (n_ >= w.n_nodes() ? "*" : "") << " (" << n_ << ")"
+          << ", level=" << lvl_ << ", dir=" << dir_;
+      if (is_rental_node()) {
+        out << ", way=" << w.way_osm_idx_[w.r_->node_ways_[n_][way_]] << " ("
+            << static_cast<unsigned>(way_) << ")";
+      }
+      out << ", type=" << node_type_to_str(type_);
+      if (color() != kNoColor) {
+        out << ", color=" << static_cast<unsigned>(color());
+      }
+      return out << ")";
     }
 
     static constexpr node invalid() noexcept { return {}; }
     constexpr node_idx_t get_node() const noexcept { return n_; }
-    constexpr key get_key() const noexcept { return {n_, lvl_}; }
+    constexpr key get_key() const noexcept { return {n_, lvl_, color()}; }
+
+    // Walking states have no way position, so `way_` holds their color
+    // instead (0 = none, c + 1 = color c): colors cost no node/label space.
+    constexpr color_t color() const noexcept {
+      return is_foot_node() && way_ != 0U ? static_cast<color_t>(way_ - 1U)
+                                          : kNoColor;
+    }
+
+    constexpr node with_color(color_t const c) const noexcept {
+      assert(is_foot_node());
+      auto colored = *this;
+      colored.way_ = color_to_way(c);
+      return colored;
+    }
+
+    static constexpr way_pos_t color_to_way(color_t const c) noexcept {
+      return c == kNoColor ? way_pos_t{0U} : static_cast<way_pos_t>(c + 1U);
+    }
 
     constexpr std::optional<direction> get_direction() const noexcept {
       return dir_;
@@ -176,6 +214,10 @@ struct car_sharing {
       return type_ == node_type::kTrailingFoot;
     }
 
+    constexpr bool is_foot_node() const noexcept {
+      return is_initial_foot_node() || is_trailing_foot_node();
+    }
+
     constexpr bool is_invalid_node() const noexcept {
       return type_ == node_type::kInvalid;
     }
@@ -189,7 +231,7 @@ struct car_sharing {
     node_type type_{node_type::kInvalid};
     level_t lvl_{};
     direction dir_{direction::kForward};
-    way_pos_t way_{};
+    way_pos_t way_{};  // walking states: color, see color()
   };
 
   struct label {
@@ -251,15 +293,7 @@ struct car_sharing {
     static constexpr auto const kN = storage_t::kN;
 
     std::optional<node> pred(node const n) const noexcept {
-      auto const s = s_[get_index(n)];
-      return s.pred_ == node_idx_t::invalid()
-                 ? std::nullopt
-                 : std::optional{
-                       node{.n_ = s.pred_,
-                            .type_ = static_cast<node_type>(s.pred_type_),
-                            .lvl_ = s.pred_lvl_,
-                            .dir_ = to_dir(s.pred_dir_),
-                            .way_ = s.pred_way_}};
+      return pred_of(s_[get_index(n)], n);
     }
 
     cost_t cost(node const n) const noexcept { return s_[get_index(n)].cost_; }
@@ -274,7 +308,30 @@ struct car_sharing {
                 node const pred,
                 ways::routing const& w,
                 entry_storage_arena& a) {
-      auto& s = s_.slot(get_index(n), w, n.n_, a);
+      return update_slot(s_.slot(get_index(n), w, n.n_, a), l, c, pred);
+    }
+
+    static std::optional<node> pred_of(slot const& s, node const n) noexcept {
+      if (s.pred_ == node_idx_t::invalid()) {
+        return std::nullopt;
+      }
+      // Colors are only assigned when the vehicle is left and are kept while
+      // walking on: a walking predecessor of the same type has the same color,
+      // any other predecessor has none. No slot field needed.
+      auto const pred_type = static_cast<node_type>(s.pred_type_);
+      auto const same_walk =
+          pred_type != node_type::kRental && pred_type == n.type_;
+      return node{.n_ = s.pred_,
+                  .type_ = pred_type,
+                  .lvl_ = s.pred_lvl_,
+                  .dir_ = to_dir(s.pred_dir_),
+                  .way_ = same_walk ? n.way_ : way_pos_t{s.pred_way_}};
+    }
+
+    static bool update_slot(slot& s,
+                            label const& l,
+                            cost_and_duration const c,
+                            node const pred) {
       if (c >= s.cd()) {
         return false;
       }
@@ -282,7 +339,8 @@ struct car_sharing {
       s.duration_ = c.duration_;
       s.pred_ = pred.n_;
       s.pred_lvl_ = pred.lvl_;
-      s.pred_way_ = pred.way_;
+      // a walking predecessor's `way_` is its color, restored by pred_of()
+      s.pred_way_ = pred.is_rental_node() ? pred.way_ : 0U;
       s.pred_dir_ = to_bool(pred.dir_);
       s.pred_type_ = static_cast<std::uint8_t>(pred.type_);
       s.tracking_ = l.tracking_;
@@ -313,6 +371,94 @@ struct car_sharing {
     storage_t s_;
   };
 
+  // Search state of dijkstra (replaces the default key -> entry map). A
+  // colored walking state (see sharing_data::colors_) only ever uses one slot,
+  // so it is kept in a separate map with one slot per (node, level, color)
+  // instead of a full entry each. Uncolored searches only use `entries_`.
+  struct cost_map {
+    // Either an entry or a colored walking state's slot.
+    template <bool Const>
+    struct ref {
+      cost_t cost(node const n) const noexcept {
+        return e_ != nullptr ? e_->cost(n) : s_->cost_;
+      }
+
+      duration_t duration(node const n) const noexcept {
+        return e_ != nullptr ? e_->duration(n) : s_->duration_;
+      }
+
+      std::optional<node> pred(node const n) const noexcept {
+        return e_ != nullptr ? e_->pred(n) : entry::pred_of(*s_, n);
+      }
+
+      void write(node const n, path& p) const {
+        e_ != nullptr ? e_->write(n, p) : s_->tracking_.write(p);
+      }
+
+      bool update(label const& l,
+                  node const n,
+                  cost_and_duration const c,
+                  node const pred,
+                  ways::routing const& w,
+                  entry_storage_arena& a) const
+        requires(!Const)
+      {
+        return e_ != nullptr ? e_->update(l, n, c, pred, w, a)
+                             : entry::update_slot(*s_, l, c, pred);
+      }
+
+      std::conditional_t<Const, entry const*, entry*> e_{nullptr};
+      std::conditional_t<Const, slot const*, slot*> s_{nullptr};
+    };
+
+    // Only what dijkstra needs from find(): `it->second` and `!= end()`.
+    struct const_iterator {
+      std::pair<key, ref<true>> const* operator->() const noexcept {
+        return &kv_;
+      }
+
+      friend bool operator==(const_iterator const& a, const_iterator const& b) {
+        return a.kv_.second.e_ == b.kv_.second.e_ &&
+               a.kv_.second.s_ == b.kv_.second.s_;
+      }
+
+      std::pair<key, ref<true>> kv_{};
+    };
+
+    ref<false> operator[](key const& k) {
+      return k.color_ == kNoColor ? ref<false>{.e_ = &entries_[k]}
+                                  : ref<false>{.s_ = &colored_[k]};
+    }
+
+    ref<true> at(key const& k) const {
+      return k.color_ == kNoColor ? ref<true>{.e_ = &entries_.at(k)}
+                                  : ref<true>{.s_ = &colored_.at(k)};
+    }
+
+    const_iterator find(key const& k) const {
+      if (k.color_ == kNoColor) {
+        auto const it = entries_.find(k);
+        return it == entries_.end()
+                   ? const_iterator{}
+                   : const_iterator{.kv_ = {k, ref<true>{.e_ = &it->second}}};
+      }
+      auto const it = colored_.find(k);
+      return it == colored_.end()
+                 ? const_iterator{}
+                 : const_iterator{.kv_ = {k, ref<true>{.s_ = &it->second}}};
+    }
+
+    friend const_iterator end(cost_map const&) noexcept { return {}; }
+
+    void clear() {
+      entries_.clear();
+      colored_.clear();
+    }
+
+    ankerl::unordered_dense::map<key, entry, hash> entries_;
+    ankerl::unordered_dense::map<key, slot, hash> colored_;
+  };
+
   static footp::node to_foot(node const n) {
     return {.n_ = n.n_, .lvl_ = n.lvl_};
   }
@@ -321,8 +467,21 @@ struct car_sharing {
     return {.n_ = n.n_, .way_ = n.way_, .dir_ = n.dir_};
   }
 
-  static node to_node(footp::node const n, node_type const type) {
-    return {.n_ = n.n_, .type_ = type, .lvl_ = n.lvl_};
+  static node to_node(footp::node const n,
+                      node_type const type,
+                      color_t const color = kNoColor) {
+    return {.n_ = n.n_,
+            .type_ = type,
+            .lvl_ = n.lvl_,
+            .way_ = node::color_to_way(color)};
+  }
+
+  // The walking state that follows the vehicle in search order is the one
+  // that carries a color.
+  static constexpr bool is_colorable(node const n,
+                                     direction const search_dir) noexcept {
+    return search_dir == direction::kForward ? n.is_trailing_foot_node()
+                                             : n.is_initial_foot_node();
   }
 
   static node to_node(car::node const n, level_t const lvl) {
@@ -364,7 +523,8 @@ struct car_sharing {
 
     auto const& handle_additional_edge = [&](additional_edge const& ae,
                                              node_type const nt,
-                                             cost_and_duration const edge) {
+                                             cost_and_duration const edge,
+                                             color_t const color) {
       auto const emit = [&](node const target) {
         fn(target, edge.cost_, edge.duration_, ae.distance_,
            way_idx_t::invalid(), 0, 1, elevation_storage::elevation{}, false);
@@ -389,13 +549,14 @@ struct car_sharing {
         // `footp::get_target_level`) and the backward search would never
         // produce it.
         footp::resolve_all(w, ae.to_, [&](footp::node const foot_state) {
-          emit(to_node(foot_state, nt));
+          emit(to_node(foot_state, nt, color));
         });
         return;
       }
       emit(node{.n_ = ae.to_,
                 .type_ = nt,
-                .lvl_ = nt == node_type::kRental ? kNoLevel : n.lvl_});
+                .lvl_ = nt == node_type::kRental ? kNoLevel : n.lvl_,
+                .way_ = node::color_to_way(color)});
     };
 
     auto const& continue_on_foot = [&](node_type const nt,
@@ -408,17 +569,17 @@ struct car_sharing {
               way_idx_t const way, std::uint16_t const from,
               std::uint16_t const to,
               elevation_storage::elevation const elevation, bool) {
-            fn(to_node(neighbor, nt), cost, duration, dist, way, from, to,
-               elevation, false);
+            fn(to_node(neighbor, nt, n.color()), cost, duration, dist, way, from,
+               to, elevation, false);
           });
       // The connector's other end resolves walking states, so only offer it
       // from a level `footp::resolve_all` produces here - otherwise the two
       // search directions use different states.
       if (include_additional_edges &&
-          is_resolved_foot_state<footp>(w, n,
-                                        [&](footp::node const foot_state) {
-                                          return to_node(foot_state, nt);
-                                        })) {
+          is_resolved_foot_state<footp>(
+              w, n, [&](footp::node const foot_state) {
+                return to_node(foot_state, nt, n.color());
+              })) {
         // walk to station or free-floating vehicle
         if (auto const it = sharing->additional_edges_.find(n.n_);
             it != end(sharing->additional_edges_)) {
@@ -428,7 +589,8 @@ struct car_sharing {
                 footp::way_cost(params.foot_, w, timezones,
                                 way_idx_t::invalid(), kAdditionalWayProperties,
                                 direction::kForward, ae.distance_, start_time,
-                                current_duration, SearchDir));
+                                current_duration, SearchDir),
+                n.color());
           }
         }
       }
@@ -450,7 +612,7 @@ struct car_sharing {
         // foot -> vehicle: only from a level the vehicle side resolves back to
         if (!is_resolved_foot_state<footp>(
                 w, n, [&](footp::node const foot_state) {
-                  return to_node(foot_state, n.type_);
+                  return to_node(foot_state, n.type_, n.color());
                 })) {
           return;
         }
@@ -458,8 +620,11 @@ struct car_sharing {
           emit(to_node(rental, kNoLevel));
         });
       } else {
-        footp::resolve_all(w, n.n_, [&](footp::node const foot_state) {
-          emit(to_node(foot_state, to_type));
+        // vehicle -> foot: one walking state per color of this node
+        sharing->for_each_color(n.n_, [&](color_t const color) {
+          footp::resolve_all(w, n.n_, [&](footp::node const foot_state) {
+            emit(to_node(foot_state, to_type, color));
+          });
         });
       }
     };
@@ -491,7 +656,8 @@ struct car_sharing {
               car::way_cost(params.car_, w, timezones, way_idx_t::invalid(),
                             kAdditionalWayProperties, direction::kForward,
                             ae.distance_, start_time, current_duration,
-                            SearchDir));
+                            SearchDir),
+              kNoColor);
         }
       }
     };
@@ -513,17 +679,21 @@ struct car_sharing {
                                 kAdditionalWayProperties, direction::kForward,
                                 ae.distance_, start_time, current_duration,
                                 SearchDir),
-                            kStartSwitchPenalty));
+                            kStartSwitchPenalty),
+                  kNoColor);
             } else if (n.is_rental_node() &&
                        is_allowed(sharing->end_allowed_, n.n_)) {
-              handle_additional_edge(
-                  ae, node_type::kTrailingFoot,
-                  clamp_add(footp::way_cost(
-                                params.foot_, w, timezones,
-                                way_idx_t::invalid(), kAdditionalWayProperties,
-                                direction::kForward, ae.distance_, start_time,
-                                current_duration, SearchDir),
-                            kEndSwitchPenalty));
+              auto const edge = clamp_add(
+                  footp::way_cost(
+                      params.foot_, w, timezones, way_idx_t::invalid(),
+                      kAdditionalWayProperties, direction::kForward,
+                      ae.distance_, start_time, current_duration, SearchDir),
+                  kEndSwitchPenalty);
+              // drop-off at a station: colored by the station
+              sharing->for_each_color(n.n_, [&](color_t const color) {
+                handle_additional_edge(ae, node_type::kTrailingFoot, edge,
+                                       color);
+              });
             }
           }
         }
@@ -558,17 +728,21 @@ struct car_sharing {
                                 kAdditionalWayProperties, direction::kForward,
                                 ae.distance_, start_time, current_duration,
                                 SearchDir),
-                            kEndSwitchPenalty));
+                            kEndSwitchPenalty),
+                  kNoColor);
             } else if (n.is_rental_node() &&
                        is_allowed(sharing->start_allowed_, n.n_)) {
-              handle_additional_edge(
-                  ae, node_type::kInitialFoot,
-                  clamp_add(footp::way_cost(
-                                params.foot_, w, timezones,
-                                way_idx_t::invalid(), kAdditionalWayProperties,
-                                direction::kForward, ae.distance_, start_time,
-                                current_duration, SearchDir),
-                            kStartSwitchPenalty));
+              auto const edge = clamp_add(
+                  footp::way_cost(
+                      params.foot_, w, timezones, way_idx_t::invalid(),
+                      kAdditionalWayProperties, direction::kForward,
+                      ae.distance_, start_time, current_duration, SearchDir),
+                  kStartSwitchPenalty);
+              // pickup at a station (backward): colored by the station
+              sharing->for_each_color(n.n_, [&](color_t const color) {
+                handle_additional_edge(ae, node_type::kInitialFoot, edge,
+                                       color);
+              });
             }
           }
         }

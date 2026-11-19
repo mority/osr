@@ -42,6 +42,10 @@ struct rental_duration_info {
   duration_t ride_end_;
 };
 
+// With sharing_data::colors_ set (car_sharing only), there is one result per
+// destination and color: index = dest_idx * n_colors + color, for results(),
+// reconstruct() and rental_durations() alike. Colored results are rides only
+// (no walk-only paths).
 struct one_to_many_state {
   virtual ~one_to_many_state() = default;
   virtual std::vector<std::optional<path>> const& results() const = 0;

@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include <cmath>
+#include <concepts>
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -412,6 +413,15 @@ struct destination_candidate {
   cost_and_duration total_;
 };
 
+// Profiles whose walking state after the vehicle can carry a color
+// (see sharing_data::colors_).
+template <typename P>
+concept colored_profile = requires(typename P::node n, direction const d) {
+  { P::is_colorable(n, d) } -> std::convertible_to<bool>;
+  { n.with_color(color_t{}) } -> std::same_as<typename P::node>;
+};
+
+// `color` != kNoColor: only paths that leave the vehicle with this color.
 template <Profile P, typename Search>
 std::optional<destination_candidate<P>> best_candidate(
     typename P::parameters const& params,
@@ -420,12 +430,24 @@ std::optional<destination_candidate<P>> best_candidate(
     match_view_t const& matches,
     cost_t const max,
     direction const dir,
-    std::optional<routing_time_t> const start_time) {
+    std::optional<routing_time_t> const start_time,
+    color_t const color = kNoColor) {
   auto best = std::optional<destination_candidate<P>>{};
   auto const end = route_end_of(opposite(dir));
   for_each_endpoint_candidate(matches, [&](endpoint_candidate const& endpoint) {
     auto const& candidate_node = endpoint.node_;
-    auto const consider = [&](auto const node) {
+    auto const consider = [&](auto node) {
+      if constexpr (colored_profile<P>) {
+        // resolve_endpoint yields uncolored states: pick the colored twin of
+        // the walking state after the vehicle, skip all others (walk only,
+        // vehicle return at the destination).
+        if (color != kNoColor) {
+          if (!P::is_colorable(node, dir)) {
+            return;
+          }
+          node = node.with_color(color);
+        }
+      }
       auto const target_cost = search.get_cost(node);
       if (target_cost == kInfeasible) {
         return;
@@ -866,10 +888,10 @@ struct one_to_many_state_impl final : public one_to_many_state {
     }
     auto const& c = *candidates_[k];
     auto const& sp = d_.params_;
-    return osr::reconstruct<P>(sp.profile_, w, l, sp.blocked_, sharing,
-                               sp.elevations_, d_, sp.start_loc_, to_[k],
-                               starts_, c.endpoint_, c.connection_, c.node_,
-                               c.total_, sp.dir_, sp.start_time_);
+    return osr::reconstruct<P>(
+        sp.profile_, w, l, sp.blocked_, sharing, sp.elevations_, d_,
+        sp.start_loc_, to_[k / n_colors_], starts_, c.endpoint_, c.connection_,
+        c.node_, c.total_, sp.dir_, sp.start_time_);
   }
 
   std::optional<rental_duration_info> rental_durations(
@@ -929,6 +951,8 @@ struct one_to_many_state_impl final : public one_to_many_state {
   // so `reconstruct()` takes it from the caller.
   dijkstra<P> d_;
   std::vector<location> to_;
+  // Results, candidates: index k = destination * n_colors_ + color.
+  std::size_t n_colors_{1U};
   std::vector<endpoint_root<P>> starts_;
   std::vector<std::optional<destination_candidate<P>>> candidates_;
   std::vector<std::optional<path>> results_;
@@ -952,7 +976,22 @@ std::vector<std::optional<path>> route(
     elevation_storage const* elevations,
     std::function<bool(path const&)> const& do_reconstruct,
     one_to_many_state_impl<P>* const state = nullptr) {
-  auto result = std::vector<std::optional<path>>(to_match.size());
+  // Colored: one result per (destination, color), k = i * n_colors + color.
+  auto const colored = sharing != nullptr && sharing->is_colored();
+  auto const n_colors = colored ? sharing->n_colors() : std::size_t{1U};
+  utl::verify(!colored || colored_profile<P>,
+              "sharing colors are only supported by car_sharing");
+  utl::verify(n_colors <= kMaxColors, "too many sharing colors: {} (max {})",
+              n_colors, kMaxColors);
+  if (state != nullptr) {
+    state->n_colors_ = n_colors;
+  }
+  auto const dest_of = [&](std::size_t const k) { return k / n_colors; };
+  auto const color_of = [&](std::size_t const k) {
+    return colored ? static_cast<color_t>(k % n_colors) : kNoColor;
+  };
+
+  auto result = std::vector<std::optional<path>>(to_match.size() * n_colors);
 
   if (from_match.empty() || to_match.empty()) {
     return result;
@@ -989,11 +1028,12 @@ std::vector<std::optional<path>> route(
         d.add_start(std::forward<decltype(label)>(label), duration);
       });
   d.run();
-  auto const find_candidate = [&](std::size_t const i) {
+  auto const find_candidate = [&](std::size_t const k) {
+    auto const i = dest_of(k);
     return best_candidate<P>(
         params, w, d,
         to_match[match_idx_t{static_cast<match_idx_t::value_t>(i)}],
-        destination_limits[i], dir, start_time);
+        destination_limits[i], dir, start_time, color_of(k));
   };
   auto local_candidates =
       std::vector<std::optional<destination_candidate<P>>>{};
@@ -1001,42 +1041,47 @@ std::vector<std::optional<path>> route(
   candidates.resize(result.size());
   auto stretches = std::vector<std::optional<path>>(result.size());
   auto settle_cost = cost_t{0U};
-  for (auto i = std::size_t{0U}; i != result.size(); ++i) {
-    candidates[i] = find_candidate(i);
-    if (candidates[i].has_value() &&
-        candidates[i]->total_.duration_ <= max_duration) {
-      settle_cost = std::max(settle_cost, candidates[i]->total_.cost_);
+  for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+    auto const i = dest_of(k);
+    candidates[k] = find_candidate(k);
+    if (candidates[k].has_value() &&
+        candidates[k]->total_.duration_ <= max_duration) {
+      settle_cost = std::max(settle_cost, candidates[k]->total_.cost_);
     }
-    if (try_direct(from, to[i], dir).has_value()) {
+    // Direct and same-stretch paths walk only: no color, no ride.
+    if (colored || try_direct(from, to[i], dir).has_value()) {
       continue;
     }
-    stretches[i] = same_stretch_path<P>(
+    stretches[k] = same_stretch_path<P>(
         params, w, l, from, to[i], from_match,
         to_match[match_idx_t{static_cast<match_idx_t::value_t>(i)}], dir,
         start_time, destination_limits[i]);
-    if (stretches[i].has_value() && stretches[i]->duration_ <= max_duration) {
-      settle_cost = std::max(settle_cost, stretches[i]->cost_);
+    if (stretches[k].has_value() && stretches[k]->duration_ <= max_duration) {
+      settle_cost = std::max(settle_cost, stretches[k]->cost_);
     }
   }
   // Finalize all candidates (and settle up to the direct pieces) before
   // reconstructing paths from the shared search.
   if (d.settle_up_to(settle_cost)) {
-    for (auto i = std::size_t{0U}; i != result.size(); ++i) {
-      candidates[i] = find_candidate(i);
+    for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+      candidates[k] = find_candidate(k);
     }
   }
-  for (auto i = std::size_t{0U}; i != result.size(); ++i) {
-    if (auto direct = try_direct(from, to[i], dir); direct.has_value()) {
-      result[i] = within_duration_limit(std::move(direct), max_duration);
-      candidates[i].reset();
-      continue;
+  for (auto k = std::size_t{0U}; k != result.size(); ++k) {
+    auto const i = dest_of(k);
+    if (!colored) {
+      if (auto direct = try_direct(from, to[i], dir); direct.has_value()) {
+        result[k] = within_duration_limit(std::move(direct), max_duration);
+        candidates[k].reset();
+        continue;
+      }
     }
-    auto const& candidate = candidates[i];
-    if (auto& stretch = stretches[i];
+    auto const& candidate = candidates[k];
+    if (auto& stretch = stretches[k];
         stretch.has_value() &&
         (!candidate.has_value() || total_of(*stretch) < candidate->total_)) {
-      result[i] = within_duration_limit(std::move(stretch), max_duration);
-      candidates[i].reset();
+      result[k] = within_duration_limit(std::move(stretch), max_duration);
+      candidates[k].reset();
       continue;
     }
     if (!candidate.has_value() || candidate->total_.duration_ > max_duration) {
@@ -1051,7 +1096,7 @@ std::vector<std::optional<path>> route(
                          candidate->connection_, candidate->node_,
                          candidate->total_, dir, start_time);
     }
-    result[i] = std::move(p);
+    result[k] = std::move(p);
   }
   return result;
 }
@@ -1198,7 +1243,8 @@ std::unique_ptr<one_to_many_state> route_one_to_many(
       profile, [&]<Profile P>(P&&) -> std::unique_ptr<one_to_many_state> {
         auto s = std::make_unique<one_to_many_state_impl<P>>(to);
         if (from_match.empty()) {
-          s->results_.resize(to.size());
+          s->n_colors_ = sharing == nullptr ? 1U : sharing->n_colors();
+          s->results_.resize(to.size() * s->n_colors_);
           return s;
         }
         s->results_ =

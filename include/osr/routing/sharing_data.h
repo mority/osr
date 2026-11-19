@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <span>
 #include <vector>
 
 #include "geo/latlng.h"
@@ -11,6 +13,14 @@
 #include "osr/ways.h"
 
 namespace osr {
+
+// Colors split the walking state after the vehicle is left - in search order:
+// trailing foot for forward searches, initial foot for backward searches - by
+// where it was left. Each color keeps its own labels, so a cheaper drop-off
+// for one color cannot prune the path of another color.
+using color_t = std::uint8_t;
+constexpr auto const kNoColor = color_t{0xFFU};
+constexpr auto const kMaxColors = std::size_t{kNoColor};
 
 inline void verify_additional_edge_count(
     hash_map<node_idx_t, std::vector<additional_edge>> const& edges,
@@ -56,9 +66,34 @@ struct sharing_data {
   bitvec<node_idx_t> const* end_allowed_{};
   bitvec<node_idx_t> const* through_allowed_{};
 
+  bool is_colored() const { return !colors_.empty(); }
+
+  std::size_t n_colors() const { return is_colored() ? colors_.size() : 1U; }
+
+  // Calls fn once per color of node n (fn(kNoColor) if uncolored).
+  template <typename Fn>
+  void for_each_color(node_idx_t const n, Fn&& fn) const {
+    if (!is_colored()) {
+      fn(kNoColor);
+      return;
+    }
+    for (auto c = std::size_t{0U}; c != colors_.size(); ++c) {
+      if (colors_[c]->test(n)) {
+        fn(static_cast<color_t>(c));
+      }
+    }
+  }
+
   node_idx_t::value_t additional_node_offset_{};
   std::vector<geo::latlng> const& additional_node_coordinates_;
   hash_map<node_idx_t, std::vector<additional_edge>> const& additional_edges_;
+
+  // Optional. colors_[c] holds the nodes where leaving the vehicle yields
+  // color c: a subset of end_allowed_ for forward searches, of start_allowed_
+  // for backward searches, sized like them (additional nodes included).
+  // A node may have several colors (overlapping areas). Empty: one uncolored
+  // search, as before.
+  std::span<bitvec<node_idx_t> const* const> colors_{};
 };
 
 inline bool is_allowed(bitvec<node_idx_t> const* b, node_idx_t const n) {

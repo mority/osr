@@ -21,6 +21,20 @@ namespace osr {
 
 struct sharing_data;
 
+// One entry per key, unless the profile brings its own map with the same
+// interface (operator[], at, find, end, clear).
+template <typename P>
+struct cost_map_of {
+  using type = ankerl::unordered_dense::
+      map<typename P::key, typename P::entry, typename P::hash>;
+};
+
+template <typename P>
+  requires requires { typename P::cost_map; }
+struct cost_map_of<P> {
+  using type = typename P::cost_map;
+};
+
 template <Profile P, bool EarlyTermination = false>
 struct dijkstra {
   using profile_t = P;
@@ -243,7 +257,7 @@ struct dijkstra {
   params_t params_;
 
   dial<label, get_bucket> pq_{get_bucket{}};
-  ankerl::unordered_dense::map<key, entry, hash> cost_;
+  typename cost_map_of<P>::type cost_;
   entry_storage_arena arena_;
 
   // Highest cost reached within the duration limit, or requested by
