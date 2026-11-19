@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -42,6 +43,10 @@ struct one_to_many_state {
                                           sharing_data const*) = 0;
 };
 
+// `colors`: empty, or one color per `to` (invalid = none). Once a member of a
+// color is found within the limits, the search continues past them for the
+// other members. Each may cost up to the cheapest found member's cost plus the
+// search limit for the straight-line gap between the two.
 std::unique_ptr<one_to_many_state> route_one_to_many(
     profile_parameters const&,
     ways const&,
@@ -58,7 +63,8 @@ std::unique_ptr<one_to_many_state> route_one_to_many(
     elevation_storage const* = nullptr,
     std::function<bool(path const&)> const& do_reconstruct =
         [](path const&) { return false; },
-    std::optional<routing_time_t> = std::nullopt);
+    std::optional<routing_time_t> = std::nullopt,
+    std::span<color_idx_t const> colors = {});
 
 std::vector<std::optional<path>> route(
     profile_parameters const&,

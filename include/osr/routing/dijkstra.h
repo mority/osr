@@ -112,7 +112,7 @@ struct dijkstra {
 
   // Drain the entire bucket: equal-cost labels can still improve duration.
   void extend_settle_horizon(cost_t const cost, duration_t const duration) {
-    if (duration <= params_.max_duration_) {
+    if (duration <= params_.max_duration_ && cost < params_.settle_max_) {
       settle_horizon_ = std::max(settle_horizon_, cost);
     }
   }
@@ -246,9 +246,10 @@ struct dijkstra {
   ankerl::unordered_dense::map<key, entry, hash> cost_;
   entry_storage_arena arena_;
 
-  // Highest cost reached within the duration limit, or requested by
-  // settle_up_to(). Over-limit labels still expand to dominate costlier routes,
-  // but cannot raise the horizon because their successors are also over limit.
+  // Highest cost below settle_max_ reached within the duration limit, or
+  // requested by settle_up_to(). Over-limit labels still expand to dominate
+  // costlier routes, but cannot raise the horizon because their successors are
+  // also over limit.
   cost_t settle_horizon_{0U};
 
   // for early termination

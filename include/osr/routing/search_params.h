@@ -20,7 +20,9 @@ struct search_params {
   ProfileParameters profile_{};
   ways const* w_{nullptr};
 
-  cost_t max_{0U};
+  cost_t max_{0U};  // labels at or above are not pushed
+  cost_t settle_max_{kInfeasible};  // labels at or above don't extend the
+                                    // settle horizon
   duration_t max_duration_{kMaxDuration};
   direction dir_{direction::kForward};
   std::optional<routing_time_t> start_time_{};

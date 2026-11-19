@@ -10,6 +10,7 @@
 #include <span>
 #include <utility>
 
+#include "utl/erase_if.h"
 #include "utl/helpers/algorithm.h"
 #include "utl/to_vec.h"
 #include "utl/verify.h"
@@ -872,6 +873,159 @@ struct one_to_many_state_impl final : public one_to_many_state {
   std::vector<std::optional<path>> results_;
 };
 
+// Target indices per color, for colors with at least two members.
+std::vector<std::vector<std::size_t>> color_groups(
+    std::span<color_idx_t const> colors) {
+  auto order = std::vector<std::size_t>{};
+  for (auto i = std::size_t{0U}; i != colors.size(); ++i) {
+    if (colors[i] != color_idx_t::invalid()) {
+      order.push_back(i);
+    }
+  }
+  std::ranges::stable_sort(order, {},
+                           [&](std::size_t const i) { return colors[i]; });
+  auto groups = std::vector<std::vector<std::size_t>>{};
+  for (auto a = begin(order); a != end(order);) {
+    auto const b = std::find_if(a, end(order), [&](std::size_t const i) {
+      return colors[i] != colors[*a];
+    });
+    if (std::distance(a, b) > 1) {
+      groups.emplace_back(a, b);
+    }
+    a = b;
+  }
+  return groups;
+}
+
+// Cost a member may take on top of a found member of its color: the search
+// limit for the straight-line gap between them at the slowest speed.
+template <Profile P>
+cost_t color_budget(typename P::parameters const& params,
+                    profile_parameters const& pp,
+                    location const& found,
+                    location const& member) {
+  auto const gap =
+      P::upper_bound_heuristic(params, geo::distance(found.pos_, member.pos_));
+  return cost_search_limit(
+      pp, clamp_duration(static_cast<std::uint64_t>(std::ceil(gap))));
+}
+
+// Continues a one-to-many search for the members of colors with a found
+// member, each up to the cheapest found member's cost + `color_budget`.
+template <Profile P>
+void settle_colors(
+    typename P::parameters const& params,
+    ways const& w,
+    lookup const& l,
+    dijkstra<P, false>& d,
+    location const& from,
+    std::vector<location> const& to,
+    match_view_t const& from_match,
+    match_result const& to_match,
+    direction const dir,
+    std::optional<routing_time_t> const start_time,
+    bitvec<node_idx_t> const* blocked,
+    sharing_data const* sharing,
+    elevation_storage const* elevations,
+    std::function<bool(path const&)> const& do_reconstruct,
+    std::vector<std::vector<std::size_t>> const& groups,
+    std::vector<cost_t> const& destination_limits,
+    std::span<endpoint_root<P> const> const starts,
+    std::vector<std::optional<destination_candidate<P>>>& candidates,
+    std::vector<std::optional<path>>& result) {
+  constexpr auto const kStep = cost_t{60U};
+
+  struct member {
+    std::size_t i_;
+    cost_t budget_;
+    std::optional<path> stretch_;
+  };
+
+  auto const match_of = [&](std::size_t const i) {
+    return to_match[match_idx_t{static_cast<match_idx_t::value_t>(i)}];
+  };
+
+  auto const pp = profile_parameters{params};
+  auto pending = std::vector<member>{};
+  for (auto const& g : groups) {
+    for (auto const i : g) {
+      if (result[i].has_value() || destination_limits[i] == 0U ||
+          match_of(i).empty()) {
+        continue;
+      }
+      auto budget = kInfeasible;
+      for (auto const found : g) {
+        if (result[found].has_value()) {
+          budget = std::min(
+              budget,
+              clamp_cost(static_cast<std::uint64_t>(result[found]->cost_) +
+                         color_budget<P>(params, pp, to[found], to[i])));
+        }
+      }
+      if (budget == kInfeasible) {
+        continue;  // no member of this color found
+      }
+      budget = std::min(budget, static_cast<cost_t>(d.params_.max_ - 1U));
+      pending.push_back(
+          member{i, budget,
+                 same_stretch_path<P>(params, w, l, from, to[i], from_match,
+                                      match_of(i), dir, start_time,
+                                      clamp_cost(budget + std::uint64_t{1U}))});
+    }
+  }
+
+  auto const finish = [&](member& m,
+                          std::optional<destination_candidate<P>> const& c) {
+    if (m.stretch_.has_value() &&
+        (!c.has_value() || total_of(*m.stretch_) < c->total_)) {
+      result[m.i_] = std::move(m.stretch_);
+      candidates[m.i_].reset();
+      return;
+    }
+    auto p = path{.cost_ = c->total_.cost_, .duration_ = c->total_.duration_};
+    d.cost_.at(c->node_.get_key()).write(c->node_, p);
+    if (do_reconstruct(p)) {
+      p = reconstruct<P>(params, w, l, blocked, sharing, elevations, d, from,
+                         to[m.i_], starts, c->endpoint_, c->connection_,
+                         c->node_, c->total_, dir, start_time);
+    }
+    result[m.i_] = std::move(p);
+    candidates[m.i_] = c;
+  };
+
+  // All states with a cost <= settled are final. A member is final once its
+  // best total (candidate or same-stretch path) is <= settled.
+  auto settled = d.settle_horizon_;
+  while (!pending.empty()) {
+    auto next = kInfeasible;
+    utl::erase_if(pending, [&](member& m) {
+      auto const c = best_candidate<P>(
+          params, w, d, match_of(m.i_),
+          clamp_cost(m.budget_ + std::uint64_t{1U}), dir, start_time);
+      auto const total =
+          std::min(c.has_value() ? c->total_.cost_ : kInfeasible,
+                   m.stretch_.has_value() ? m.stretch_->cost_ : kInfeasible);
+      if (total != kInfeasible && total <= settled) {
+        finish(m, c);
+        return true;
+      }
+      if (m.budget_ <= settled) {
+        return true;  // not within its budget
+      }
+      next = std::min(
+          next, total != kInfeasible
+                    ? total
+                    : std::min(m.budget_,
+                               clamp_cost(static_cast<std::uint64_t>(settled) +
+                                          kStep)));
+      return false;
+    });
+    if (!pending.empty()) {
+      settled = !d.settle_up_to(next) && d.pq_.empty() ? kInfeasible : next;
+    }
+  }
+}
+
 template <Profile P>
 std::vector<std::optional<path>> route(
     typename P::parameters const& params,
@@ -889,7 +1043,10 @@ std::vector<std::optional<path>> route(
     sharing_data const* sharing,
     elevation_storage const* elevations,
     std::function<bool(path const&)> const& do_reconstruct,
-    one_to_many_state_impl<P>* const state = nullptr) {
+    one_to_many_state_impl<P>* const state = nullptr,
+    std::span<color_idx_t const> const colors = {}) {
+  utl::verify(colors.empty() || colors.size() == to.size(),
+              "route: {} colors for {} destinations", colors.size(), to.size());
   auto result = std::vector<std::optional<path>>(to_match.size());
 
   if (from_match.empty() || to_match.empty()) {
@@ -915,9 +1072,30 @@ std::vector<std::optional<path>> route(
       connected_candidates<P>(w, sharing, from_match, to_match.way_);
   auto const from_connected = from_connected_m[match_idx_t{0U}];
   auto const max = std::ranges::max(destination_limits);
+
+  // Labels past `max` stay in the queue for the second phase (colors), up to
+  // the largest budget a member can get.
+  auto const groups = color_groups(colors);
+  auto color_slack = cost_t{0U};
+  if (!groups.empty()) {
+    auto const pp = profile_parameters{params};
+    for (auto const& g : groups) {
+      for (auto const a : g) {
+        for (auto const b : g) {
+          color_slack =
+              std::max(color_slack, color_budget<P>(params, pp, to[a], to[b]));
+        }
+      }
+    }
+  }
+
   d.reset({.profile_ = params,
            .w_ = &w,
-           .max_ = max,
+           .max_ = static_cast<cost_t>(std::min(
+               static_cast<std::uint64_t>(max) + color_slack,
+               std::max(static_cast<std::uint64_t>(max),
+                        static_cast<std::uint64_t>(kMaxDurationSearchCost)))),
+           .settle_max_ = max,
            .max_duration_ = max_duration,
            .dir_ = dir,
            .start_time_ = start_time,
@@ -996,6 +1174,12 @@ std::vector<std::optional<path>> route(
                          candidate->total_, dir, start_time);
     }
     result[i] = std::move(p);
+  }
+
+  if (!groups.empty()) {
+    settle_colors<P>(params, w, l, d, from, to, from_match, to_match, dir,
+                     start_time, blocked, sharing, elevations, do_reconstruct,
+                     groups, destination_limits, starts, candidates, result);
   }
   return result;
 }
@@ -1144,7 +1328,8 @@ std::unique_ptr<one_to_many_state> route_one_to_many(
     sharing_data const* sharing,
     elevation_storage const* elevations,
     std::function<bool(path const&)> const& do_reconstruct,
-    std::optional<routing_time_t> const start_time) {
+    std::optional<routing_time_t> const start_time,
+    std::span<color_idx_t const> const colors) {
   auto const duration_limit = to_duration_limit(max_duration);
   return with_profile(
       profile, [&]<Profile P>(P&&) -> std::unique_ptr<one_to_many_state> {
@@ -1153,10 +1338,10 @@ std::unique_ptr<one_to_many_state> route_one_to_many(
           s->results_.resize(to.size());
           return s;
         }
-        s->results_ =
-            route(std::get<typename P::parameters>(params), w, l, s->d_, from,
-                  s->to_, from_match, to_match, duration_limit, dir, start_time,
-                  blocked, sharing, elevations, do_reconstruct, s.get());
+        s->results_ = route(std::get<typename P::parameters>(params), w, l,
+                            s->d_, from, s->to_, from_match, to_match,
+                            duration_limit, dir, start_time, blocked, sharing,
+                            elevations, do_reconstruct, s.get(), colors);
         return s;
       });
 }
